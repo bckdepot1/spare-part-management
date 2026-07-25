@@ -10,6 +10,8 @@
  * that one bypasses RLS entirely and must stay inside the Supabase dashboard.
  */
 window.SPM_CONFIG = {
-  url: 'https://YOUR-PROJECT-REF.supabase.co',
-  anonKey: 'YOUR-ANON-PUBLIC-KEY'
+  url: 'https://nngepjxjjnkaefgubqvp.supabase.co',
+  // Paste the "Publishable key" from Settings → API Keys here (starts with sb_publishable_).
+  // Do NOT paste the "Secret key" (sb_secret_...) — that one must never leave the dashboard.
+  anonKey: 'PASTE-YOUR-PUBLISHABLE-KEY-HERE'
 };

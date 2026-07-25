@@ -151,7 +151,12 @@
 
   (function initSupabase() {
     var cfg = window.SPM_CONFIG || {};
-    if (!cfg.url || !cfg.anonKey || cfg.url.indexOf('YOUR-PROJECT-REF') !== -1 || cfg.anonKey.indexOf('YOUR-ANON') !== -1) {
+    // Catches any leftover placeholder text regardless of exact wording, plus anything
+    // implausibly short to be a real Supabase URL/key — safer than matching one fixed string.
+    var placeholder = /YOUR[-_]|PASTE|xxxxxxxxxxxx|example/i;
+    var looksReal = cfg.url && cfg.anonKey && !placeholder.test(cfg.url) && !placeholder.test(cfg.anonKey)
+      && cfg.url.indexOf('https://') === 0 && cfg.anonKey.length >= 20;
+    if (!looksReal) {
       configError = 'ยังไม่ได้ตั้งค่าการเชื่อมต่อฐานข้อมูล กรุณาแก้ไขค่าในไฟล์ config.js ให้ครบก่อนใช้งาน (ดูวิธีที่ SUPABASE_SETUP.md)';
       return;
     }
