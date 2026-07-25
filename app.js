@@ -1,0 +1,1475 @@
+/* Spare Part Management — application logic.
+ *
+ * A single-page app with no build step. State lives in one object; every mutation
+ * goes through setState()/render(), which rebuilds the active view and restores
+ * focus/scroll so typing in a field is not interrupted.
+ *
+ * Data lives in Supabase (Postgres): the `stock`, `transactions` and `profiles`
+ * tables are readable by any signed-in active user (see db/schema.sql), and every
+ * write goes through a Postgres RPC function that re-checks the caller's role
+ * itself — the browser never has to be trusted with permission logic.
+ *
+ * Login uses Supabase Auth, which needs an email. The UI only ever shows a short
+ * "User" handle, so the frontend logs in with a synthetic address
+ * `<username>@login.spareapart.internal` — it never has to be a real, deliverable
+ * inbox, it just has to satisfy the email format Supabase Auth expects.
+ */
+(function () {
+  'use strict';
+
+  // ------------------------------------------------------------------ config
+
+  var LOGIN_DOMAIN = '@login.spareapart.internal';
+
+  var ROLE_LABEL = { admin: 'Admin', supervisor: 'Supervisor', operator: 'Operator' };
+
+  var PAGE_TITLE = {
+    overview: 'Overview',
+    receive: 'รับอะไหล่เข้า',
+    issue: 'จ่ายอะไหล่ออก',
+    log: 'ประวัติ/Log',
+    inventory: 'รายการอุปกรณ์',
+    users: 'จัดการผู้ใช้งาน',
+    settings: 'ตั้งค่า'
+  };
+
+  var STATUS_LABEL = {
+    approved: 'อนุมัติแล้ว',
+    pending: 'รออนุมัติ',
+    rejected: 'ปฏิเสธ',
+    ok: 'ปกติ',
+    low: 'ต่ำกว่า Min'
+  };
+
+  // The chart draws one column per day; a very wide range would produce
+  // thousands of columns, so the window is clamped.
+  var MAX_CHART_DAYS = 120;
+
+  // ----------------------------------------------------------------- helpers
+
+  function esc(value) {
+    if (value === null || value === undefined) return '';
+    return String(value).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+
+  function raw(markup) {
+    return { __raw: String(markup) };
+  }
+
+  function interpolate(value) {
+    if (value === null || value === undefined || value === false) return '';
+    if (Array.isArray(value)) return value.map(interpolate).join('');
+    if (value && value.__raw !== undefined) return value.__raw;
+    return esc(value);
+  }
+
+  /** Tagged template that escapes every interpolated value unless wrapped in raw(). */
+  function html(strings) {
+    var out = strings[0];
+    for (var i = 1; i < arguments.length; i++) {
+      out += interpolate(arguments[i]) + strings[i];
+    }
+    return out;
+  }
+
+  function pad2(n) {
+    return String(n).padStart(2, '0');
+  }
+
+  /** Local calendar date as YYYY-MM-DD (toISOString would shift by the UTC offset). */
+  function isoDate(d) {
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+  }
+
+  function todayStr() {
+    return isoDate(new Date());
+  }
+
+  function daysAgoStr(n) {
+    var d = new Date();
+    d.setDate(d.getDate() - n);
+    return isoDate(d);
+  }
+
+  function parseIsoDate(s) {
+    var p = String(s || '').split('-');
+    return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+  }
+
+  function formatDateThai(dateStr) {
+    if (!dateStr) return '';
+    var p = String(dateStr).split('-');
+    return p[2] + '-' + p[1] + '-' + p[0];
+  }
+
+  function usernameToEmail(username) {
+    return String(username || '').trim().toLowerCase() + LOGIN_DOMAIN;
+  }
+
+  function getPath(obj, path) {
+    return path.split('.').reduce(function (o, k) { return o == null ? o : o[k]; }, obj);
+  }
+
+  function setPath(obj, path, value) {
+    var keys = path.split('.');
+    var target = obj;
+    for (var i = 0; i < keys.length - 1; i++) target = target[keys[i]];
+    target[keys[keys.length - 1]] = value;
+    return target;
+  }
+
+  /** Human-readable text from a Supabase/Postgres error, falling back to a generic message. */
+  function errorMessage(error, fallback) {
+    if (!error) return fallback;
+    // RPC exceptions raised with `raise exception '...'` arrive in error.message as-is.
+    return error.message || fallback;
+  }
+
+  var ICON = {
+    overview: '<path d="M3 11l9-8 9 8"></path><path d="M5 10v10h5v-6h4v6h5V10"></path>',
+    receive: '<path d="M12 3v12M8 11l4 4 4-4"></path><path d="M4 19h16"></path>',
+    issue: '<path d="M12 21V9M8 13l4-4 4 4"></path><path d="M4 5h16"></path>',
+    log: '<circle cx="12" cy="12" r="9"></circle><path d="M12 7v5l3 3"></path>',
+    inventory: '<path d="M3 7l9-4 9 4-9 4-9-4z"></path><path d="M3 7v10l9 4 9-4V7"></path><path d="M12 11v10"></path>',
+    users: '<circle cx="9" cy="8" r="3"></circle><path d="M2 20c0-3.3 3.1-5 7-5s7 1.7 7 5"></path><circle cx="17" cy="9" r="2.6"></circle><path d="M16 12.2c2.6.4 4.3 1.8 4.3 3.8"></path>',
+    settings: '<circle cx="12" cy="12" r="7.5"></circle><circle cx="12" cy="12" r="2.6"></circle>',
+    logout: '<path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"></path><path d="M16 17l5-5-5-5"></path><path d="M21 12H9"></path>',
+    person: '<circle cx="12" cy="8" r="4"></circle><path d="M4 20c0-4 3.6-6 8-6s8 2 8 6"></path>'
+  };
+
+  function icon(name, size) {
+    return raw('<svg width="' + size + '" height="' + size + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+      'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">' + ICON[name] + '</svg>');
+  }
+
+  // -------------------------------------------------------------- supabase client
+
+  var supabaseClient = null;
+  var configError = '';
+
+  (function initSupabase() {
+    var cfg = window.SPM_CONFIG || {};
+    if (!cfg.url || !cfg.anonKey || cfg.url.indexOf('YOUR-PROJECT-REF') !== -1 || cfg.anonKey.indexOf('YOUR-ANON') !== -1) {
+      configError = 'ยังไม่ได้ตั้งค่าการเชื่อมต่อฐานข้อมูล กรุณาแก้ไขค่าในไฟล์ config.js ให้ครบก่อนใช้งาน (ดูวิธีที่ SUPABASE_SETUP.md)';
+      return;
+    }
+    if (!window.supabase || !window.supabase.createClient) {
+      configError = 'โหลดไลบรารี Supabase ไม่สำเร็จ กรุณาตรวจสอบการเชื่อมต่ออินเทอร์เน็ตแล้วรีเฟรชหน้านี้อีกครั้ง';
+      return;
+    }
+    supabaseClient = window.supabase.createClient(cfg.url, cfg.anonKey);
+  })();
+
+  // ------------------------------------------------------------------- state
+
+  var state = {
+    view: configError ? 'configError' : 'loading',
+    page: 'overview',
+    currentUser: null,
+    users: [],
+    stock: [],
+    transactions: [],
+    loginForm: { username: '', password: '', error: '', showPw: false },
+    signupForm: { username: '', password: '', name: '', email: '', avatar: '', error: '', success: '' },
+    changePwForm: { current: '', next: '', confirm: '', error: '', success: '' },
+    receiveForm: { date: todayStr(), itemQuery: '', category: '', unit: '', qty: '', note: '', error: '' },
+    issueForm: { date: todayStr(), itemQuery: '', category: '', unit: '', qty: '', note: '', error: '' },
+    logFilter: { search: '', type: 'all', status: 'all', dateFrom: '', dateTo: '' },
+    chartFilter: { from: daysAgoStr(13), to: todayStr() },
+    invFilter: { search: '', category: 'all' },
+    toast: { msg: '', type: '' }
+  };
+
+  var toastTimer = null;
+  var realtimeChannel = null;
+  var inFlight = {}; // guards against double-submit while an RPC call is in flight
+
+  function setState(patch) {
+    Object.assign(state, patch);
+    render();
+  }
+
+  function showToast(msg, type) {
+    state.toast = { msg: msg, type: type || 'success' };
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () {
+      state.toast = { msg: '', type: '' };
+      render();
+    }, 2600);
+    render();
+  }
+
+  function canDirectStock() {
+    var r = state.currentUser && state.currentUser.role;
+    return r === 'admin' || r === 'supervisor';
+  }
+
+  function isAdmin() {
+    return !!state.currentUser && state.currentUser.role === 'admin';
+  }
+
+  /** Runs `fn` only if no call tagged `key` is already in flight; always clears the guard after. */
+  function guarded(key, fn) {
+    if (inFlight[key]) return;
+    inFlight[key] = true;
+    Promise.resolve().then(fn).catch(function (e) {
+      showToast(errorMessage(e, 'เกิดข้อผิดพลาด กรุณาลองใหม่'), 'error');
+    }).then(function () {
+      inFlight[key] = false;
+    });
+  }
+
+  // --------------------------------------------------------------- row mapping
+
+  function mapStockRow(r) {
+    return { id: r.id, code: r.code, category: r.category, unit: r.unit, qty: r.qty, min: r.min, max: r.max };
+  }
+
+  function mapTxRow(r) {
+    return {
+      id: r.id, date: r.tx_date, time: r.tx_time, type: r.type,
+      itemId: r.item_id, itemCode: r.item_code, category: r.category, unit: r.unit, qty: r.qty,
+      userId: r.user_id, userName: r.user_name, status: r.status, note: r.note,
+      approverName: r.approver_name
+    };
+  }
+
+  function mapProfileRow(r) {
+    return { id: r.id, username: r.username, name: r.name, email: r.email, avatar: r.avatar_url, role: r.role, status: r.status };
+  }
+
+  // ----------------------------------------------------------------- data I/O
+
+  function loadStock() {
+    return supabaseClient.from('stock').select('*').order('id').then(function (res) {
+      if (res.error) throw res.error;
+      state.stock = res.data.map(mapStockRow);
+    });
+  }
+
+  function loadTransactions() {
+    return supabaseClient.from('transactions').select('*').order('id', { ascending: false }).then(function (res) {
+      if (res.error) throw res.error;
+      state.transactions = res.data.map(mapTxRow);
+    });
+  }
+
+  function loadProfiles() {
+    return supabaseClient.from('profiles').select('*').order('id').then(function (res) {
+      if (res.error) throw res.error;
+      state.users = res.data.map(mapProfileRow);
+    });
+  }
+
+  function loadAll() {
+    return Promise.all([loadStock(), loadTransactions(), loadProfiles()]);
+  }
+
+  function refreshStock() { return loadStock().then(render); }
+  function refreshTransactions() { return loadTransactions().then(render); }
+  function refreshProfiles() { return loadProfiles().then(render); }
+
+  /** Keeps everyone's view live: any user's approve/receive/issue updates every open tab. */
+  function subscribeRealtime() {
+    if (realtimeChannel) return;
+    realtimeChannel = supabaseClient
+      .channel('spm-changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'stock' }, refreshStock)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'transactions' }, refreshTransactions)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'profiles' }, refreshProfiles)
+      .subscribe();
+  }
+
+  function unsubscribeRealtime() {
+    if (!realtimeChannel) return;
+    supabaseClient.removeChannel(realtimeChannel);
+    realtimeChannel = null;
+  }
+
+  // --------------------------------------------------------------- bootstrap
+
+  function bootstrap() {
+    if (configError) return;
+    supabaseClient.auth.getSession().then(function (res) {
+      var session = res.data && res.data.session;
+      if (session) return enterAsUser(session.user.id);
+      setState({ view: 'login' });
+    }).catch(function () {
+      setState({ view: 'login' });
+    });
+  }
+
+  /** After a valid Supabase session exists, load the matching profile and gate on its status. */
+  function enterAsUser(userId) {
+    return supabaseClient.from('profiles').select('*').eq('id', userId).single().then(function (res) {
+      if (res.error || !res.data) {
+        return supabaseClient.auth.signOut().then(function () {
+          setState({ view: 'login', loginForm: blankLoginForm('ไม่พบข้อมูลผู้ใช้งาน กรุณาลองเข้าสู่ระบบใหม่') });
+        });
+      }
+      var profile = res.data;
+      if (profile.status === 'pending') {
+        return supabaseClient.auth.signOut().then(function () {
+          setState({ view: 'login', loginForm: blankLoginForm('บัญชีนี้ยังรอ Admin หรือ Supervisor อนุมัติ') });
+        });
+      }
+      if (profile.status === 'rejected') {
+        return supabaseClient.auth.signOut().then(function () {
+          setState({ view: 'login', loginForm: blankLoginForm('บัญชีนี้ถูกปฏิเสธการสมัคร กรุณาติดต่อผู้ดูแลระบบ') });
+        });
+      }
+      state.currentUser = mapProfileRow(profile);
+      return loadAll().then(function () {
+        subscribeRealtime();
+        setState({ view: 'app', page: 'overview' });
+      });
+    });
+  }
+
+  function blankLoginForm(error) {
+    return { username: '', password: '', error: error || '', showPw: false };
+  }
+
+  // --------------------------------------------------------------- selectors
+
+  function findByCode(code) {
+    var q = String(code || '').trim().toLowerCase();
+    if (!q) return null;
+    return state.stock.find(function (s) { return s.code.trim().toLowerCase() === q; }) || null;
+  }
+
+  function stockStatus(item) {
+    return item.qty < item.min ? 'low' : 'ok';
+  }
+
+  function categories() {
+    return Array.from(new Set(state.stock.map(function (s) { return s.category; })));
+  }
+
+  function units() {
+    return Array.from(new Set(state.stock.map(function (s) { return s.unit; })));
+  }
+
+  function pendingTransactions() {
+    return state.transactions.filter(function (t) { return t.status === 'pending'; });
+  }
+
+  function pendingUsers() {
+    return state.users.filter(function (u) { return u.status === 'pending'; });
+  }
+
+  function filteredTransactions() {
+    var f = state.logFilter;
+    var search = f.search.trim().toLowerCase();
+    return state.transactions
+      .filter(function (t) { return !search || t.itemCode.toLowerCase().indexOf(search) !== -1; })
+      .filter(function (t) { return f.type === 'all' || t.type === f.type; })
+      .filter(function (t) { return f.status === 'all' || t.status === f.status; })
+      .filter(function (t) { return !f.dateFrom || t.date >= f.dateFrom; })
+      .filter(function (t) { return !f.dateTo || t.date <= f.dateTo; })
+      .sort(function (a, b) { return (a.date + a.time) < (b.date + b.time) ? 1 : -1; });
+  }
+
+  function filteredStock() {
+    var f = state.invFilter;
+    var search = f.search.trim().toLowerCase();
+    return state.stock
+      .filter(function (it) { return !search || it.code.toLowerCase().indexOf(search) !== -1; })
+      .filter(function (it) { return f.category === 'all' || it.category === f.category; });
+  }
+
+  function chartData() {
+    var approved = state.transactions.filter(function (t) { return t.status === 'approved'; });
+    var from = parseIsoDate(state.chartFilter.from || daysAgoStr(13));
+    var to = parseIsoDate(state.chartFilter.to || todayStr());
+    var days = [];
+    for (var d = new Date(from); d <= to && days.length < MAX_CHART_DAYS; d.setDate(d.getDate() + 1)) {
+      days.push(isoDate(d));
+    }
+    var maxQty = Math.max.apply(null, [1].concat(approved.map(function (t) { return t.qty; })));
+    return days.map(function (day) {
+      var inQty = 0;
+      var outQty = 0;
+      approved.forEach(function (t) {
+        if (t.date !== day) return;
+        if (t.type === 'in') inQty += t.qty; else outQty += t.qty;
+      });
+      return {
+        label: day.slice(8, 10) + '/' + day.slice(5, 7),
+        inQty: inQty,
+        outQty: outQty,
+        inH: Math.round((inQty / maxQty) * 110) + (inQty ? 4 : 0),
+        outH: Math.round((outQty / maxQty) * 110) + (outQty ? 4 : 0)
+      };
+    });
+  }
+
+  function topIssuedItems() {
+    var totals = {};
+    state.transactions.forEach(function (t) {
+      if (t.type !== 'out' || t.status !== 'approved') return;
+      if (!totals[t.itemCode]) totals[t.itemCode] = { code: t.itemCode, total: 0, unit: t.unit || '' };
+      totals[t.itemCode].total += t.qty;
+    });
+    var list = Object.keys(totals).map(function (k) { return totals[k]; })
+      .sort(function (a, b) { return b.total - a.total; })
+      .slice(0, 5);
+    var max = list.length ? list[0].total : 1;
+    return list.map(function (it) {
+      return Object.assign({}, it, { barPct: Math.round((it.total / max) * 100) });
+    });
+  }
+
+  function donutStats() {
+    var stats = { normal: 0, near: 0, low: 0 };
+    state.stock.forEach(function (it) {
+      if (it.qty < it.min) stats.low++;
+      else if (it.qty <= it.min * 1.3) stats.near++;
+      else stats.normal++;
+    });
+    return stats;
+  }
+
+  // ----------------------------------------------------------------- actions
+
+  var actions = {
+
+    // -- auth ---------------------------------------------------------------
+
+    toggleLoginPw: function () {
+      state.loginForm.showPw = !state.loginForm.showPw;
+      render();
+    },
+
+    submitLogin: function () {
+      guarded('login', function () {
+        var f = state.loginForm;
+        if (!f.username || !f.password) {
+          f.error = 'กรุณากรอกชื่อผู้ใช้และรหัสผ่าน';
+          return render();
+        }
+        return supabaseClient.auth.signInWithPassword({
+          email: usernameToEmail(f.username), password: f.password
+        }).then(function (res) {
+          if (res.error) {
+            state.loginForm.error = 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง';
+            return render();
+          }
+          return enterAsUser(res.data.user.id);
+        });
+      });
+    },
+
+    logout: function () {
+      guarded('logout', function () {
+        unsubscribeRealtime();
+        return supabaseClient.auth.signOut().then(function () {
+          setState({
+            view: 'login', currentUser: null, stock: [], transactions: [], users: [],
+            page: 'overview'
+          });
+        });
+      });
+    },
+
+    goSignup: function (el, e) {
+      e.preventDefault();
+      setState({ view: 'signup' });
+    },
+
+    goLogin: function (el, e) {
+      e.preventDefault();
+      state.signupForm = { username: '', password: '', name: '', email: '', avatar: '', error: '', success: '' };
+      setState({ view: 'login' });
+    },
+
+    signupAvatar: function (el) {
+      var file = el.files && el.files[0];
+      if (!file) return;
+      var reader = new FileReader();
+      reader.onload = function () {
+        state.signupForm.avatar = reader.result;
+        render();
+      };
+      reader.readAsDataURL(file);
+    },
+
+    submitSignup: function () {
+      guarded('signup', function () {
+        var f = state.signupForm;
+        if (!f.username || !f.password || !f.name || !f.email) {
+          f.error = 'กรุณากรอกข้อมูลให้ครบทุกช่อง';
+          return render();
+        }
+        if (f.password.length < 6) {
+          f.error = 'รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร';
+          return render();
+        }
+        return supabaseClient.auth.signUp({
+          email: usernameToEmail(f.username),
+          password: f.password,
+          options: { data: { username: f.username.trim(), name: f.name, contact_email: f.email, avatar_url: f.avatar || null } }
+        }).then(function (res) {
+          if (res.error) {
+            f.error = /already|registered|exists/i.test(res.error.message)
+              ? 'ชื่อผู้ใช้นี้ถูกใช้งานแล้ว'
+              : 'สมัครไม่สำเร็จ: ' + res.error.message;
+            return render();
+          }
+          // New accounts start as 'pending' — sign back out immediately even though
+          // signUp may hand back an active session.
+          return supabaseClient.auth.signOut().then(function () {
+            state.signupForm = {
+              username: '', password: '', name: '', email: '', avatar: '', error: '',
+              success: 'ส่งคำขอสมัครสำเร็จ กรุณารอ Admin หรือ Supervisor อนุมัติบัญชีก่อนเข้าสู่ระบบ'
+            };
+            render();
+            setTimeout(function () {
+              if (state.view !== 'signup') return;
+              state.signupForm = { username: '', password: '', name: '', email: '', avatar: '', error: '', success: '' };
+              setState({ view: 'login' });
+            }, 2400);
+          });
+        });
+      });
+    },
+
+    submitChangePassword: function () {
+      guarded('changePassword', function () {
+        var f = state.changePwForm;
+        var cu = state.currentUser;
+        return supabaseClient.auth.signInWithPassword({
+          email: usernameToEmail(cu.username), password: f.current
+        }).then(function (verify) {
+          if (verify.error) {
+            f.error = 'รหัสผ่านเดิมไม่ถูกต้อง';
+            return render();
+          }
+          if (!f.next || f.next.length < 6) {
+            f.error = 'รหัสผ่านใหม่ต้องมีอย่างน้อย 6 ตัวอักษร';
+            return render();
+          }
+          if (f.next !== f.confirm) {
+            f.error = 'รหัสผ่านใหม่ไม่ตรงกัน';
+            return render();
+          }
+          return supabaseClient.auth.updateUser({ password: f.next }).then(function (res) {
+            if (res.error) {
+              f.error = 'เปลี่ยนรหัสผ่านไม่สำเร็จ: ' + res.error.message;
+              return render();
+            }
+            state.changePwForm = { current: '', next: '', confirm: '', error: '', success: 'เปลี่ยนรหัสผ่านสำเร็จ' };
+            render();
+          });
+        });
+      });
+    },
+
+    // -- navigation ---------------------------------------------------------
+
+    nav: function (el) {
+      setState({ page: el.dataset.page });
+    },
+
+    openDatePicker: function (el) {
+      if (el.showPicker) {
+        try { el.showPicker(); } catch (e) { /* not supported / not user-activated */ }
+      }
+    },
+
+    // -- receive / issue ----------------------------------------------------
+
+    receiveItem: function (el) {
+      var f = state.receiveForm;
+      var match = findByCode(el.value);
+      f.itemQuery = el.value;
+      if (match) { f.category = match.category; f.unit = match.unit; }
+      f.error = '';
+      render();
+    },
+
+    issueItem: function (el) {
+      var f = state.issueForm;
+      var match = findByCode(el.value);
+      f.itemQuery = el.value;
+      if (match) { f.category = match.category; f.unit = match.unit; }
+      f.error = '';
+      render();
+    },
+
+    submitReceive: function () { guarded('receive', function () { return submitMovement('in'); }); },
+    submitIssue: function () { guarded('issue', function () { return submitMovement('out'); }); },
+
+    // -- approvals ----------------------------------------------------------
+
+    approveTx: function (el) {
+      var id = Number(el.dataset.id);
+      guarded('approveTx' + id, function () {
+        return supabaseClient.rpc('approve_transaction', { p_tx_id: id }).then(function (res) {
+          if (res.error) return showToast(errorMessage(res.error, 'อนุมัติไม่สำเร็จ'), 'error');
+          return Promise.all([refreshStock(), refreshTransactions()]).then(function () {
+            showToast('อนุมัติรายการสำเร็จ', 'success');
+          });
+        });
+      });
+    },
+
+    rejectTx: function (el) {
+      var id = Number(el.dataset.id);
+      guarded('rejectTx' + id, function () {
+        return supabaseClient.rpc('reject_transaction', { p_tx_id: id }).then(function (res) {
+          if (res.error) return showToast(errorMessage(res.error, 'ปฏิเสธไม่สำเร็จ'), 'error');
+          return refreshTransactions().then(function () {
+            showToast('ปฏิเสธรายการแล้ว', 'error');
+          });
+        });
+      });
+    },
+
+    // -- inventory ----------------------------------------------------------
+
+    stockMin: function (el) { updateStockMinMax(el, 'min'); },
+    stockMax: function (el) { updateStockMinMax(el, 'max'); },
+
+    // -- users --------------------------------------------------------------
+
+    userRole: function (el) {
+      if (!isAdmin()) return;
+      var id = el.dataset.id;
+      var role = el.value;
+      guarded('userRole' + id, function () {
+        return supabaseClient.rpc('set_user_role', { p_user_id: id, p_role: role }).then(function (res) {
+          if (res.error) return showToast(errorMessage(res.error, 'ปรับสิทธิ์ไม่สำเร็จ'), 'error');
+          if (state.currentUser && state.currentUser.id === id) state.currentUser.role = role;
+          return refreshProfiles();
+        });
+      });
+    },
+
+    deleteUser: function (el) {
+      var id = el.dataset.id;
+      if (id === state.currentUser.id) {
+        return showToast('ไม่สามารถลบบัญชีที่ใช้งานอยู่ได้', 'error');
+      }
+      if (!window.confirm('ยืนยันการลบบัญชีผู้ใช้งานนี้?')) return;
+      guarded('deleteUser' + id, function () {
+        return supabaseClient.rpc('delete_user', { p_user_id: id }).then(function (res) {
+          if (res.error) return showToast(errorMessage(res.error, 'ลบไม่สำเร็จ'), 'error');
+          return refreshProfiles().then(function () {
+            showToast('ลบบัญชีผู้ใช้งานสำเร็จ', 'success');
+          });
+        });
+      });
+    },
+
+    approveUser: function (el) {
+      var id = el.dataset.id;
+      guarded('approveUser' + id, function () {
+        return supabaseClient.rpc('approve_user', { p_user_id: id }).then(function (res) {
+          if (res.error) return showToast(errorMessage(res.error, 'อนุมัติไม่สำเร็จ'), 'error');
+          return refreshProfiles().then(function () {
+            showToast('อนุมัติบัญชีผู้ใช้งานสำเร็จ', 'success');
+          });
+        });
+      });
+    },
+
+    rejectUser: function (el) {
+      var id = el.dataset.id;
+      guarded('rejectUser' + id, function () {
+        return supabaseClient.rpc('reject_user', { p_user_id: id }).then(function (res) {
+          if (res.error) return showToast(errorMessage(res.error, 'ปฏิเสธไม่สำเร็จ'), 'error');
+          return refreshProfiles().then(function () {
+            showToast('ปฏิเสธการสมัครบัญชีแล้ว', 'error');
+          });
+        });
+      });
+    },
+
+    // -- export -------------------------------------------------------------
+
+    exportLog: function () {
+      var rows = [['วันที่', 'เวลา', 'ประเภท', 'รหัสอุปกรณ์', 'จำนวน', 'หมายเหตุ', 'ผู้ดำเนินการ', 'ผู้อนุมัติ', 'สถานะ']];
+      filteredTransactions().forEach(function (t) {
+        rows.push([
+          formatDateThai(t.date),
+          t.time,
+          t.type === 'in' ? 'รับเข้า' : 'จ่ายออก',
+          t.itemCode,
+          (t.type === 'in' ? '+' : '-') + t.qty,
+          t.note || '-',
+          t.userName,
+          t.approverName || '-',
+          STATUS_LABEL[t.status] || t.status
+        ]);
+      });
+      // Excel needs the UTF-8 BOM to read Thai text in a CSV correctly.
+      var csv = '﻿' + rows.map(function (r) {
+        return r.map(function (c) { return '"' + String(c).replace(/"/g, '""') + '"'; }).join(',');
+      }).join('\r\n');
+
+      var blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement('a');
+      a.href = url;
+      a.download = 'log_' + todayStr() + '.csv';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+  };
+
+  function updateStockMinMax(el, field) {
+    var id = Number(el.dataset.id);
+    var n = parseInt(el.value, 10);
+    if (isNaN(n) || n < 0) return render();
+    guarded('stock' + field + id, function () {
+      return supabaseClient.rpc('update_stock_minmax', { p_item_id: id, p_field: field, p_value: n }).then(function (res) {
+        if (res.error) return showToast(errorMessage(res.error, 'อัปเดตไม่สำเร็จ'), 'error');
+        return refreshStock().then(function () {
+          showToast('อัปเดตค่า Min/Max สำเร็จ', 'success');
+        });
+      });
+    });
+  }
+
+  /** Shared handler for the receive ('in') and issue ('out') forms. */
+  function submitMovement(type) {
+    var f = type === 'in' ? state.receiveForm : state.issueForm;
+    var item = findByCode(f.itemQuery);
+    var qty = parseInt(f.qty, 10);
+
+    if (!item || !qty || qty <= 0) {
+      f.error = 'กรุณาเลือกอุปกรณ์จากรายการและระบุจำนวนให้ถูกต้อง';
+      return render();
+    }
+    if (type === 'out' && canDirectStock() && qty > item.qty) {
+      f.error = 'จำนวนขอเบิกมากกว่าจำนวนคงเหลือใน Stock';
+      return render();
+    }
+
+    return supabaseClient.rpc('submit_transaction', {
+      p_item_id: item.id, p_type: type, p_qty: qty, p_note: f.note || '', p_tx_date: f.date
+    }).then(function (res) {
+      if (res.error) {
+        f.error = errorMessage(res.error, 'บันทึกไม่สำเร็จ');
+        return render();
+      }
+      var blank = { date: todayStr(), itemQuery: '', category: '', unit: '', qty: '', note: '', error: '' };
+      if (type === 'in') state.receiveForm = blank; else state.issueForm = blank;
+
+      var direct = canDirectStock();
+      return Promise.all([refreshStock(), refreshTransactions()]).then(function () {
+        if (type === 'in') {
+          showToast(direct ? 'บันทึกรับอะไหล่เข้าสำเร็จ' : 'ส่งคำขอรับเข้ารออนุมัติแล้ว', 'success');
+        } else {
+          showToast(direct ? 'บันทึกจ่ายอะไหล่ออกสำเร็จ' : 'ส่งคำขอเบิกรออนุมัติแล้ว', 'success');
+        }
+      });
+    });
+  }
+
+  // ------------------------------------------------------------------- views
+
+  function avatarStyle(url) {
+    return url ? 'background-image:url(' + String(url).replace(/["')]/g, '') + ')' : '';
+  }
+
+  function loadingView() {
+    return html`
+      <div class="auth-wrap">
+        <div style="color:#fff;font-size:14px;opacity:.85;">กำลังโหลด...</div>
+      </div>`;
+  }
+
+  function configErrorView() {
+    return html`
+      <div class="auth-wrap">
+        <div class="auth-card" style="width:480px;">
+          <div class="auth-title" style="color:#dc2626;">ยังไม่พร้อมใช้งาน</div>
+          <div class="alert alert--error" style="margin-top:14px;">${configError}</div>
+        </div>
+      </div>`;
+  }
+
+  function loginView() {
+    var f = state.loginForm;
+    return html`
+      <div class="auth-wrap">
+        <div class="auth-card">
+          <div class="auth-logo"><img src="assets/logo.svg" alt="โลโก้ระบบ"/></div>
+          <div class="auth-title">เข้าสู่ระบบ</div>
+          <div class="auth-sub">กรุณาเข้าสู่ระบบเพื่อใช้งานระบบ</div>
+
+          ${f.error ? raw(html`<div class="alert alert--error">${f.error}</div>`) : ''}
+
+          <div class="field">
+            <div class="field-label">User</div>
+            <input class="input" type="text" placeholder="กรอกชื่อผู้ใช้" autocomplete="username"
+                   data-key="login.username" data-model="loginForm.username" value="${f.username}"/>
+          </div>
+          <div class="field" style="margin-bottom:8px;">
+            <div class="field-label">Password</div>
+            <div class="pw-field">
+              <input class="input" type="${f.showPw ? 'text' : 'password'}" placeholder="กรอกรหัสผ่าน" autocomplete="current-password"
+                     data-key="login.password" data-model="loginForm.password" value="${f.password}"/>
+              <button class="pw-toggle" type="button" data-act="toggleLoginPw">${f.showPw ? 'ซ่อน' : 'แสดง'}</button>
+            </div>
+          </div>
+
+          <button class="btn btn--blue auth-submit" data-act="submitLogin">เข้าสู่ระบบ</button>
+
+          <div class="auth-foot">ยังไม่มีบัญชี? <a href="#" class="link" data-act="goSignup">สร้างบัญชีใช้งาน</a></div>
+        </div>
+      </div>`;
+  }
+
+  function signupView() {
+    var f = state.signupForm;
+    return html`
+      <div class="auth-wrap">
+        <div class="auth-card auth-card--signup">
+          <div class="auth-title">สร้างบัญชีใช้งาน</div>
+          <div class="auth-sub">บัญชีใหม่จะได้รับสิทธิ์ระดับ Operator เริ่มต้น</div>
+
+          <div class="avatar-pick">
+            <div class="avatar-circle" style="${avatarStyle(f.avatar)}">
+              ${f.avatar ? '' : raw('<svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#98a2b3" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + ICON.person + '</svg>')}
+            </div>
+            <label>
+              เลือกรูปโปรไฟล์
+              <input type="file" accept="image/*" data-act-change="signupAvatar"/>
+            </label>
+          </div>
+
+          ${f.error ? raw(html`<div class="alert alert--error">${f.error}</div>`) : ''}
+          ${f.success ? raw(html`<div class="alert alert--success">${f.success}</div>`) : ''}
+
+          <div class="grid-2">
+            <div>
+              <div class="field-label">User</div>
+              <input class="input" type="text" placeholder="ชื่อผู้ใช้" autocomplete="username"
+                     data-key="signup.username" data-model="signupForm.username" value="${f.username}"/>
+            </div>
+            <div>
+              <div class="field-label">Password</div>
+              <input class="input" type="password" placeholder="รหัสผ่าน" autocomplete="new-password"
+                     data-key="signup.password" data-model="signupForm.password" value="${f.password}"/>
+            </div>
+          </div>
+          <div class="field" style="margin-bottom:12px;">
+            <div class="field-label">ชื่อ-นามสกุล</div>
+            <input class="input" type="text" placeholder="กรอกชื่อ-นามสกุล"
+                   data-key="signup.name" data-model="signupForm.name" value="${f.name}"/>
+          </div>
+          <div class="field" style="margin-bottom:8px;">
+            <div class="field-label">Email</div>
+            <input class="input" type="email" placeholder="กรอกอีเมล" autocomplete="email"
+                   data-key="signup.email" data-model="signupForm.email" value="${f.email}"/>
+          </div>
+
+          <button class="btn btn--blue" style="margin-top:16px;" data-act="submitSignup">สมัครใช้งาน</button>
+          <div class="auth-foot">มีบัญชีแล้ว? <a href="#" class="link" data-act="goLogin">เข้าสู่ระบบ</a></div>
+        </div>
+      </div>`;
+  }
+
+  function navItem(page, label, badge) {
+    return html`
+      <button class="nav-item ${state.page === page ? 'is-active' : ''}" data-act="nav" data-page="${page}">
+        ${icon(page, 19)}
+        <span>${label}</span>
+        ${badge ? raw(html`<span class="nav-badge">${badge}</span>`) : ''}
+      </button>`;
+  }
+
+  function sidebar() {
+    var cu = state.currentUser;
+    return html`
+      <div class="sidebar">
+        <div class="brand">
+          <img src="assets/logo.svg" alt=""/>
+          <div style="min-width:0;">
+            <div class="brand-name">Spare Part</div>
+            <div class="brand-sub">Management</div>
+          </div>
+        </div>
+
+        <div class="user-card">
+          <div class="user-avatar" style="${avatarStyle(cu.avatar)}">${cu.avatar ? '' : (cu.name || '').charAt(0)}</div>
+          <div class="user-meta">
+            <div class="user-name">${cu.name}</div>
+            <div class="user-role">${ROLE_LABEL[cu.role] || cu.role}</div>
+          </div>
+        </div>
+
+        <div class="nav">
+          ${raw(navItem('overview', 'Overview'))}
+          ${raw(navItem('receive', 'รับอะไหล่เข้า'))}
+          ${raw(navItem('issue', 'จ่ายอะไหล่ออก'))}
+          ${raw(navItem('log', 'ประวัติ/Log', pendingTransactions().length))}
+          ${raw(navItem('inventory', 'รายการอุปกรณ์'))}
+          ${canDirectStock() ? raw(navItem('users', 'จัดการผู้ใช้งาน', pendingUsers().length)) : ''}
+          ${raw(navItem('settings', 'ตั้งค่า'))}
+        </div>
+
+        <button class="logout-btn" data-act="logout">${icon('logout', 18)}ออกจากระบบ</button>
+      </div>`;
+  }
+
+  function overviewPage() {
+    var stats = donutStats();
+    var total = state.stock.length;
+    var monthNow = todayStr().slice(0, 7);
+    var approved = state.transactions.filter(function (t) { return t.status === 'approved'; });
+    var kpiIn = approved.filter(function (t) { return t.type === 'in' && t.date.slice(0, 7) === monthNow; }).length;
+    var kpiOut = approved.filter(function (t) { return t.type === 'out' && t.date.slice(0, 7) === monthNow; }).length;
+    var lowItems = state.stock.filter(function (it) { return it.qty < it.min; });
+    var top = topIssuedItems();
+
+    var normalDeg = total ? (stats.normal / total) * 360 : 0;
+    var nearDeg = normalDeg + (total ? (stats.near / total) * 360 : 0);
+    var donutGradient = total
+      ? 'conic-gradient(#16a34a 0deg ' + normalDeg + 'deg, #f59e0b ' + normalDeg + 'deg ' + nearDeg + 'deg, #dc2626 ' + nearDeg + 'deg 360deg)'
+      : '#eef1f6';
+
+    return html`
+      <div class="kpi-grid">
+        <div class="card kpi">
+          <div class="kpi-label">รับเข้า (เดือนนี้)</div>
+          <div class="kpi-value kpi-value--in">${kpiIn}</div>
+          <div class="kpi-unit">รายการ</div>
+        </div>
+        <div class="card kpi">
+          <div class="kpi-label">จ่ายออก (เดือนนี้)</div>
+          <div class="kpi-value kpi-value--out">${kpiOut}</div>
+          <div class="kpi-unit">รายการ</div>
+        </div>
+        <div class="card kpi">
+          <div class="kpi-label">คงเหลือทั้งหมด</div>
+          <div class="kpi-value">${total}</div>
+          <div class="kpi-unit">รายการอุปกรณ์</div>
+        </div>
+        <div class="card kpi">
+          <div class="kpi-label">ต่ำกว่าค่า Min</div>
+          <div class="kpi-value kpi-value--low">${lowItems.length}</div>
+          <div class="kpi-unit">รายการ</div>
+        </div>
+      </div>
+
+      <div class="row-chart">
+        <div class="card">
+          <div class="chart-head">
+            <div class="card-title" style="margin-bottom:0;">สรุปการรับ-จ่าย</div>
+            <div class="legend">
+              <span><span class="legend-dot legend-dot--in"></span>รับเข้า</span>
+              <span><span class="legend-dot legend-dot--out"></span>จ่ายออก</span>
+            </div>
+          </div>
+          <div class="daterange">
+            <span>จาก</span>
+            ${raw(dateField('chart.from', 'chartFilter.from', state.chartFilter.from, 'sm'))}
+            <span>ถึง</span>
+            ${raw(dateField('chart.to', 'chartFilter.to', state.chartFilter.to, 'sm'))}
+          </div>
+          <div class="chart" data-scroll-key="chart">
+            ${chartData().map(function (bar) {
+              return raw(html`
+                <div class="bar-col">
+                  <div class="bar-stack">
+                    <div class="bar bar--in" title="รับเข้า ${bar.inQty}" style="height:${bar.inH}px;"></div>
+                    <div class="bar bar--out" title="จ่ายออก ${bar.outQty}" style="height:${bar.outH}px;"></div>
+                  </div>
+                  <div class="bar-vals">
+                    <div class="bar-val bar-val--in">${bar.inQty}</div>
+                    <div class="bar-val bar-val--out">${bar.outQty}</div>
+                  </div>
+                  <div class="bar-label">${bar.label}</div>
+                </div>`);
+            })}
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">รายการต่ำกว่า Min</div>
+          <div class="low-list" data-scroll-key="low">
+            ${lowItems.slice(0, 6).map(function (it) {
+              return raw(html`
+                <div class="low-item">
+                  <div style="min-width:0;">
+                    <div class="low-code">${it.code}</div>
+                    <div class="low-cat">${it.category}</div>
+                  </div>
+                  <div class="low-qty">${it.qty}/${it.min} ${it.unit}</div>
+                </div>`);
+            })}
+            ${lowItems.length ? '' : raw('<div class="muted-note">ไม่มีรายการต่ำกว่าค่า Min</div>')}
+          </div>
+        </div>
+      </div>
+
+      <div class="row-bottom">
+        <div class="card">
+          <div class="card-title">Top อุปกรณ์ที่ถูกเบิกเยอะสุด</div>
+          <div class="top-list">
+            ${top.map(function (it) {
+              return raw(html`
+                <div>
+                  <div class="top-head">
+                    <div class="top-code">${it.code}</div>
+                    <div class="top-total">${it.total} ${it.unit}</div>
+                  </div>
+                  <div class="top-track"><div class="top-fill" style="width:${it.barPct}%;"></div></div>
+                </div>`);
+            })}
+            ${top.length ? '' : raw('<div class="muted-note">ยังไม่มีข้อมูลการเบิกจ่าย</div>')}
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Stock คงเหลือตามช่วง Min-Max</div>
+          <div class="donut-row">
+            <div class="donut">
+              <div class="donut-ring" style="background:${donutGradient};"></div>
+              <div class="donut-hole">
+                <div class="donut-value">${total}</div>
+                <div class="donut-unit">รายการ</div>
+              </div>
+            </div>
+            <div class="donut-legend">
+              <div><span class="swatch swatch--normal"></span><span>ปกติ ( &gt; Min ) <b>${stats.normal}</b> รายการ</span></div>
+              <div><span class="swatch swatch--near"></span><span>ใกล้ Min <b>${stats.near}</b> รายการ</span></div>
+              <div><span class="swatch swatch--low"></span><span>ต่ำกว่า Min <b>${stats.low}</b> รายการ</span></div>
+            </div>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  function dateField(key, model, value, size) {
+    return html`
+      <div class="date-wrap date-wrap--${size}">
+        <input type="date" lang="en-GB" data-key="${key}" data-model="${model}" data-act="openDatePicker" value="${value}"/>
+        <div class="date-display">${value ? formatDateThai(value) : 'วัน-เดือน-ปี'}</div>
+      </div>`;
+  }
+
+  function datalist(id, values) {
+    return html`<datalist id="${id}">${values.map(function (v) {
+      return raw(html`<option value="${v}"></option>`);
+    })}</datalist>`;
+  }
+
+  /** The receive and issue forms differ only in copy, colour and the stock hint. */
+  function movementPage(type) {
+    var f = type === 'in' ? state.receiveForm : state.issueForm;
+    var prefix = type === 'in' ? 'receive' : 'issue';
+    var selected = type === 'out' ? findByCode(f.itemQuery) : null;
+
+    return html`
+      <div class="card form-card">
+        ${canDirectStock() ? '' : raw(html`<div class="alert alert--warn">${type === 'in'
+          ? 'คำขอของคุณจะถูกส่งไปรออนุมัติจาก Supervisor/Admin ก่อนบันทึกเข้า Stock'
+          : 'คำขอเบิกของคุณจะถูกส่งไปรออนุมัติจาก Supervisor/Admin ก่อนตัด Stock'}</div>`)}
+        ${f.error ? raw(html`<div class="alert alert--error" style="font-size:12.5px;">${f.error}</div>`) : ''}
+
+        <div class="field">
+          <div class="field-label">วันที่</div>
+          <input class="input input--form" type="date" data-key="${prefix}.date" data-model="${prefix}Form.date" value="${f.date}"/>
+        </div>
+
+        <div class="field">
+          <div class="field-label">อุปกรณ์</div>
+          <input class="input input--form" type="text" list="${prefix}ItemsList" placeholder="พิมพ์ค้นหาหรือเลือกอุปกรณ์..."
+                 data-key="${prefix}.item" data-act-input="${prefix}Item" value="${f.itemQuery}"/>
+          ${raw(datalist(prefix + 'ItemsList', state.stock.map(function (s) { return s.code; })))}
+          <div class="form-row">
+            <div>
+              <div class="sub-label">หมวดหมู่</div>
+              <input class="input input--sm" type="text" list="${prefix}CategoryList"
+                     data-key="${prefix}.category" data-model="${prefix}Form.category" value="${f.category}"/>
+              ${raw(datalist(prefix + 'CategoryList', categories()))}
+            </div>
+            <div>
+              <div class="sub-label">หน่วย</div>
+              <input class="input input--sm" type="text" list="${prefix}UnitList"
+                     data-key="${prefix}.unit" data-model="${prefix}Form.unit" value="${f.unit}"/>
+              ${raw(datalist(prefix + 'UnitList', units()))}
+            </div>
+          </div>
+          ${selected ? raw(html`<div class="stock-hint">คงเหลือ: ${selected.qty} ${selected.unit}</div>`) : ''}
+        </div>
+
+        <div class="field">
+          <div class="field-label">${type === 'in' ? 'จำนวนรับเข้า' : 'จำนวนขอเบิก'}</div>
+          <input class="input input--form" type="number" min="1" placeholder="0"
+                 data-key="${prefix}.qty" data-model="${prefix}Form.qty" value="${f.qty}"/>
+        </div>
+
+        <div class="field" style="margin-bottom:8px;">
+          <div class="field-label">หมายเหตุ</div>
+          <textarea class="textarea input--form" placeholder="ระบุหมายเหตุ (ถ้ามี)"
+                    data-key="${prefix}.note" data-model="${prefix}Form.note">${f.note}</textarea>
+        </div>
+
+        <div class="meta-line">${type === 'in' ? 'ผู้รับเข้า' : 'ผู้ขอเบิก'}: ${state.currentUser.name} (${state.currentUser.username})</div>
+        <button class="btn ${type === 'in' ? 'btn--green' : 'btn--red'}" data-act="${type === 'in' ? 'submitReceive' : 'submitIssue'}">บันทึกข้อมูล</button>
+      </div>`;
+  }
+
+  function logPage() {
+    var pending = pendingTransactions();
+    var rows = filteredTransactions();
+
+    return html`
+      ${canDirectStock() && pending.length ? raw(html`
+        <div class="pending-card">
+          <div class="pending-title">รายการรออนุมัติ (${pending.length})</div>
+          <div class="pending-list">
+            ${pending.map(function (tx) {
+              return raw(html`
+                <div class="pending-item">
+                  <div class="pending-main">
+                    <div class="pending-head">${tx.type === 'in' ? 'รับเข้า' : 'จ่ายออก'} · ${tx.itemCode} · ${tx.qty} ${tx.unit}</div>
+                    <div class="pending-meta">${formatDateThai(tx.date)} ${tx.time} · ขอโดย ${tx.userName}</div>
+                    <div class="pending-note">หมายเหตุ: ${tx.note || '-'}</div>
+                  </div>
+                  <div class="pending-actions">
+                    <button class="btn-sm btn-approve" data-act="approveTx" data-id="${tx.id}">อนุมัติ</button>
+                    <button class="btn-sm btn-reject" data-act="rejectTx" data-id="${tx.id}">ปฏิเสธ</button>
+                  </div>
+                </div>`);
+            })}
+          </div>
+        </div>`) : ''}
+
+      <div class="card">
+        <div class="section-head">
+          <div class="section-title">ประวัติการรับ-จ่ายอะไหล่</div>
+          <button class="btn-export" data-act="exportLog">${icon('receive', 14)}Export Excel</button>
+        </div>
+
+        <div class="toolbar">
+          <input class="input" type="text" placeholder="ค้นหารหัสอุปกรณ์..."
+                 data-key="log.search" data-model="logFilter.search" value="${state.logFilter.search}"/>
+          <select class="select" data-key="log.type" data-model="logFilter.type">
+            ${selectOptions([['all', 'ทุกประเภท'], ['in', 'รับเข้า'], ['out', 'จ่ายออก']], state.logFilter.type)}
+          </select>
+          <select class="select" data-key="log.status" data-model="logFilter.status">
+            ${selectOptions([['all', 'ทุกสถานะ'], ['approved', 'อนุมัติแล้ว'], ['pending', 'รออนุมัติ'], ['rejected', 'ปฏิเสธ']], state.logFilter.status)}
+          </select>
+          <div class="toolbar-dates">
+            <span>จาก</span>
+            ${raw(dateField('log.from', 'logFilter.dateFrom', state.logFilter.dateFrom, 'md'))}
+            <span>ถึง</span>
+            ${raw(dateField('log.to', 'logFilter.dateTo', state.logFilter.dateTo, 'md'))}
+          </div>
+        </div>
+
+        <table class="table">
+          <thead>
+            <tr>
+              <th>วันที่</th><th>เวลา</th><th>ประเภท</th><th>อุปกรณ์</th>
+              <th class="num">จำนวน</th><th>หมายเหตุ</th><th>ผู้ดำเนินการ</th><th>ผู้อนุมัติ</th><th class="mid">สถานะ</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${rows.map(function (t) {
+              return raw(html`
+                <tr>
+                  <td class="soft">${formatDateThai(t.date)}</td>
+                  <td class="soft">${t.time}</td>
+                  <td><span class="badge badge--${t.type}">${t.type === 'in' ? 'รับเข้า' : 'จ่ายออก'}</span></td>
+                  <td class="strong">${t.itemCode}</td>
+                  <td class="num" style="font-weight:600;">${(t.type === 'in' ? '+' : '-') + t.qty} ${t.unit}</td>
+                  <td class="note-cell" title="${t.note || ''}">${t.note || '-'}</td>
+                  <td class="soft">${t.userName}</td>
+                  <td class="soft">${t.approverName || '-'}</td>
+                  <td class="mid"><span class="badge badge--${t.status}">${STATUS_LABEL[t.status] || t.status}</span></td>
+                </tr>`);
+            })}
+            ${rows.length ? '' : raw('<tr><td class="empty" colspan="9">ไม่พบรายการที่ตรงกับเงื่อนไข</td></tr>')}
+          </tbody>
+        </table>
+      </div>`;
+  }
+
+  function selectOptions(pairs, selected) {
+    return pairs.map(function (p) {
+      return raw(html`<option value="${p[0]}" ${p[0] === selected ? raw('selected') : ''}>${p[1]}</option>`);
+    });
+  }
+
+  function inventoryPage() {
+    var editable = canDirectStock();
+    var rows = filteredStock();
+
+    return html`
+      <div class="card">
+        <div class="section-title" style="margin-bottom:16px;">รายการอุปกรณ์ทั้งหมด (${state.stock.length})</div>
+        <div class="toolbar">
+          <input class="input" type="text" placeholder="ค้นหารหัสอุปกรณ์..."
+                 data-key="inv.search" data-model="invFilter.search" value="${state.invFilter.search}"/>
+          <select class="select select--cat" data-key="inv.category" data-model="invFilter.category">
+            ${selectOptions([['all', 'ทุกหมวดหมู่']].concat(categories().map(function (c) { return [c, c]; })), state.invFilter.category)}
+          </select>
+        </div>
+        <div class="inv-scroll" data-scroll-key="inventory">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>#</th><th>รหัสอุปกรณ์</th><th>หมวดหมู่</th><th>หน่วย</th>
+                <th class="num">คงเหลือ</th><th class="num">Min</th><th class="num">Max</th><th class="mid">สถานะ</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows.map(function (it) {
+                var status = stockStatus(it);
+                return raw(html`
+                  <tr>
+                    <td style="color:#98a2b3;font-size:12px;">${it.id}</td>
+                    <td class="strong">${it.code}</td>
+                    <td class="soft">${it.category}</td>
+                    <td class="soft">${it.unit}</td>
+                    <td class="num" style="font-weight:600;">${it.qty}</td>
+                    <td class="num">${editable
+                      ? raw(html`<input class="mini-input" type="number" min="0" data-key="min.${it.id}" data-act-change="stockMin" data-id="${it.id}" value="${it.min}"/>`)
+                      : raw(html`<span style="color:#98a2b3;">${it.min}</span>`)}</td>
+                    <td class="num">${editable
+                      ? raw(html`<input class="mini-input" type="number" min="0" data-key="max.${it.id}" data-act-change="stockMax" data-id="${it.id}" value="${it.max}"/>`)
+                      : raw(html`<span style="color:#98a2b3;">${it.max}</span>`)}</td>
+                    <td class="mid"><span class="badge badge--${status}">${STATUS_LABEL[status]}</span></td>
+                  </tr>`);
+              })}
+              ${rows.length ? '' : raw('<tr><td class="empty" colspan="8">ไม่พบอุปกรณ์ที่ตรงกับเงื่อนไข</td></tr>')}
+            </tbody>
+          </table>
+        </div>
+      </div>`;
+  }
+
+  function usersPage() {
+    var admin = isAdmin();
+    var pending = pendingUsers();
+    var list = state.users.filter(function (u) { return u.status !== 'pending'; });
+
+    return html`
+      ${pending.length ? raw(html`
+        <div class="pending-card">
+          <div class="pending-title">บัญชีรอการอนุมัติ (${pending.length})</div>
+          <div class="pending-list">
+            ${pending.map(function (u) {
+              return raw(html`
+                <div class="pending-item">
+                  <div class="pending-main">
+                    <div class="pending-head">${u.name} (${u.username})</div>
+                    <div class="pending-meta">${u.email}</div>
+                  </div>
+                  <div class="pending-actions">
+                    <button class="btn-sm btn-approve" data-act="approveUser" data-id="${u.id}">อนุมัติ</button>
+                    <button class="btn-sm btn-reject" data-act="rejectUser" data-id="${u.id}">ปฏิเสธ</button>
+                  </div>
+                </div>`);
+            })}
+          </div>
+        </div>`) : ''}
+
+      <div class="card" style="margin-bottom:20px;">
+        <div class="section-head">
+          <div class="section-title">รายชื่อผู้ใช้งาน (${list.length})</div>
+        </div>
+        <table class="table">
+          <thead>
+            <tr>
+              <th></th><th>ชื่อ-นามสกุล</th><th>User</th>
+              <th>Email</th><th>สิทธิ์การใช้งาน</th>
+              ${admin ? raw('<th class="mid">จัดการ</th>') : ''}
+            </tr>
+          </thead>
+          <tbody>
+            ${list.map(function (u) {
+              return raw(html`
+                <tr>
+                  <td><div class="u-avatar" style="${avatarStyle(u.avatar)}">${u.avatar ? '' : raw(html`<span class="u-initial">${(u.name || '').charAt(0)}</span>`)}</div></td>
+                  <td style="font-size:13px;font-weight:600;color:#101a2e;">${u.name}</td>
+                  <td class="soft" style="font-size:13px;">${u.username}</td>
+                  <td class="soft" style="font-size:13px;">${u.email}</td>
+                  <td>${admin
+                    ? raw(html`<select class="u-role-select" data-key="role.${u.id}" data-act-change="userRole" data-id="${u.id}">
+                        ${selectOptions([['operator', 'Operator'], ['supervisor', 'Supervisor'], ['admin', 'Admin']], u.role)}
+                      </select>`)
+                    : raw(html`<span class="u-role-text">${ROLE_LABEL[u.role] || u.role}</span>`)}</td>
+                  ${admin ? raw(html`<td class="mid">${u.id === state.currentUser.id ? '' :
+                    raw(html`<button class="btn-delete" data-act="deleteUser" data-id="${u.id}">ลบ</button>`)}</td>`) : ''}
+                </tr>`);
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="role-note">
+        <b>Operator</b> — ขออนุมัติเบิกจ่ายอะไหล่ แต่ไม่มีสิทธิ์ตัดหรือเพิ่ม Stock ได้เอง<br/>
+        <b>Supervisor</b> — อนุมัติการรับเข้า-จ่ายออกของ Stock ได้ทั้งหมด<br/>
+        <b>Admin</b> — ทำได้ทั้งหมด รวมถึงการกำหนดสิทธิ์ผู้ใช้งาน
+      </div>`;
+  }
+
+  function settingsPage() {
+    var f = state.changePwForm;
+    return html`
+      <div class="card form-card form-card--narrow">
+        <div class="section-title" style="margin-bottom:4px;">เปลี่ยนรหัสผ่าน</div>
+        <div style="font-size:13px;color:#64748b;margin-bottom:20px;">บัญชี: ${state.currentUser.username}</div>
+
+        ${f.error ? raw(html`<div class="alert alert--error" style="font-size:12.5px;margin-bottom:14px;">${f.error}</div>`) : ''}
+        ${f.success ? raw(html`<div class="alert alert--success" style="font-size:12.5px;margin-bottom:14px;">${f.success}</div>`) : ''}
+
+        <div class="field">
+          <div class="field-label">รหัสผ่านเดิม</div>
+          <input class="input input--form" type="password" placeholder="กรอกรหัสผ่านเดิม" autocomplete="current-password"
+                 data-key="pw.current" data-model="changePwForm.current" value="${f.current}"/>
+        </div>
+        <div class="field">
+          <div class="field-label">รหัสผ่านใหม่</div>
+          <input class="input input--form" type="password" placeholder="กรอกรหัสผ่านใหม่" autocomplete="new-password"
+                 data-key="pw.next" data-model="changePwForm.next" value="${f.next}"/>
+        </div>
+        <div class="field" style="margin-bottom:8px;">
+          <div class="field-label">ยืนยันรหัสผ่านใหม่อีกครั้ง</div>
+          <input class="input input--form" type="password" placeholder="ยืนยันรหัสผ่านใหม่" autocomplete="new-password"
+                 data-key="pw.confirm" data-model="changePwForm.confirm" value="${f.confirm}"/>
+        </div>
+        <button class="btn btn--blue" style="margin-top:12px;" data-act="submitChangePassword">บันทึกการเปลี่ยนแปลง</button>
+      </div>`;
+  }
+
+  function pageBody() {
+    switch (state.page) {
+      case 'receive': return movementPage('in');
+      case 'issue': return movementPage('out');
+      case 'log': return logPage();
+      case 'inventory': return inventoryPage();
+      case 'users': return canDirectStock() ? usersPage() : overviewPage();
+      case 'settings': return settingsPage();
+      default: return overviewPage();
+    }
+  }
+
+  function appView() {
+    return html`
+      <div class="app">
+        ${raw(sidebar())}
+        <div class="main" data-scroll-key="main">
+          <div class="topbar">
+            <div class="topbar-title">${PAGE_TITLE[state.page] || ''}</div>
+            <div class="topbar-right">
+              <div class="topbar-user">${state.currentUser.name}</div>
+              <span class="topbar-role topbar-role--${state.currentUser.role}">${ROLE_LABEL[state.currentUser.role] || state.currentUser.role}</span>
+            </div>
+          </div>
+          <div class="content">
+            ${state.toast.msg ? raw(html`<div class="toast ${state.toast.type === 'error' ? 'toast--error' : ''}">${state.toast.msg}</div>`) : ''}
+            ${raw(pageBody())}
+          </div>
+        </div>
+      </div>`;
+  }
+
+  // ------------------------------------------------------------------ render
+
+  var root = document.getElementById('root');
+
+  function render() {
+    var active = document.activeElement;
+    var focusKey = active && active.dataset ? active.dataset.key : null;
+    var selStart = null;
+    var selEnd = null;
+    if (focusKey) {
+      try { selStart = active.selectionStart; selEnd = active.selectionEnd; } catch (e) { /* unsupported type */ }
+    }
+
+    var scrolls = {};
+    root.querySelectorAll('[data-scroll-key]').forEach(function (el) {
+      scrolls[el.dataset.scrollKey] = el.scrollTop;
+    });
+
+    if (state.view === 'configError') root.innerHTML = configErrorView();
+    else if (state.view === 'loading') root.innerHTML = loadingView();
+    else if (state.view === 'login') root.innerHTML = loginView();
+    else if (state.view === 'signup') root.innerHTML = signupView();
+    else if (state.currentUser) root.innerHTML = appView();
+    else root.innerHTML = loginView();
+
+    root.querySelectorAll('[data-scroll-key]').forEach(function (el) {
+      var saved = scrolls[el.dataset.scrollKey];
+      if (saved) el.scrollTop = saved;
+    });
+
+    if (focusKey) {
+      var next = root.querySelector('[data-key="' + focusKey.replace(/"/g, '\\"') + '"]');
+      if (next) {
+        next.focus();
+        if (selStart !== null) {
+          try { next.setSelectionRange(selStart, selEnd); } catch (e) { /* unsupported type */ }
+        }
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------ events
+
+  function runAction(name, el, event) {
+    var fn = actions[name];
+    if (fn) fn(el, event);
+  }
+
+  root.addEventListener('click', function (e) {
+    var el = e.target.closest('[data-act]');
+    if (!el || !root.contains(el)) return;
+    // Date inputs use data-act only to open the native picker on click.
+    if (el.tagName === 'A') e.preventDefault();
+    runAction(el.dataset.act, el, e);
+  });
+
+  function handleModelEvent(e) {
+    var el = e.target;
+    if (!el.dataset) return;
+
+    if (el.dataset.model) {
+      var form = getPath(state, el.dataset.model.split('.')[0]);
+      setPath(state, el.dataset.model, el.value);
+      // Editing a form field clears any message the previous attempt left behind.
+      if (form && typeof form === 'object') {
+        if ('error' in form) form.error = '';
+        if ('success' in form) form.success = '';
+      }
+      return render();
+    }
+    if (e.type === 'input' && el.dataset.actInput) return runAction(el.dataset.actInput, el, e);
+    if (e.type === 'change' && el.dataset.actChange) return runAction(el.dataset.actChange, el, e);
+  }
+
+  root.addEventListener('input', handleModelEvent);
+  root.addEventListener('change', function (e) {
+    // data-model inputs already handled on `input`; only run change-only hooks.
+    if (e.target.dataset && e.target.dataset.model) return;
+    handleModelEvent(e);
+  });
+
+  root.addEventListener('keydown', function (e) {
+    if (e.key !== 'Enter') return;
+    var el = e.target;
+    if (el.tagName === 'TEXTAREA') return;
+    if (state.view === 'login') { e.preventDefault(); actions.submitLogin(); }
+    else if (state.view === 'signup') { e.preventDefault(); actions.submitSignup(); }
+    else if (el.dataset && el.dataset.actChange) el.blur();
+  });
+
+  // -------------------------------------------------------------------- boot
+
+  render();
+  bootstrap();
+})();

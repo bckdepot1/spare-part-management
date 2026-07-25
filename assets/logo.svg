@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Spare Part Management">
+  <rect width="128" height="128" rx="26" fill="#101a2e"/>
+  <!-- inventory box -->
+  <g fill="none" stroke="#2f6fed" stroke-width="6" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M64 30 L98 48 L98 84 L64 102 L30 84 L30 48 Z"/>
+    <path d="M30 48 L64 66 L98 48"/>
+    <path d="M64 66 L64 102"/>
+  </g>
+  <!-- gear = spare part -->
+  <g transform="translate(64 56)">
+    <g fill="#f5b301">
+      <circle r="15"/>
+      <g>
+        <rect x="-3.4" y="-22" width="6.8" height="9" rx="1.5"/>
+        <rect x="-3.4" y="13" width="6.8" height="9" rx="1.5"/>
+        <rect x="-22" y="-3.4" width="9" height="6.8" rx="1.5"/>
+        <rect x="13" y="-3.4" width="9" height="6.8" rx="1.5"/>
+        <rect x="-3.4" y="-22" width="6.8" height="9" rx="1.5" transform="rotate(45)"/>
+        <rect x="-3.4" y="13" width="6.8" height="9" rx="1.5" transform="rotate(45)"/>
+        <rect x="-22" y="-3.4" width="9" height="6.8" rx="1.5" transform="rotate(45)"/>
+        <rect x="13" y="-3.4" width="9" height="6.8" rx="1.5" transform="rotate(45)"/>
+      </g>
+    </g>
+    <circle r="6" fill="#101a2e"/>
+  </g>
+</svg>
