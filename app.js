@@ -872,7 +872,7 @@
           </div>
           <div class="field" style="margin-bottom:8px;">
             <div class="field-label">Email</div>
-            <input class="input" type="email" placeholder="กรอกอีเมล" autocomplete="email"
+            <input class="input" type="text" inputmode="email" placeholder="กรอกอีเมล" autocomplete="email"
                    data-key="signup.email" data-model="signupForm.email" value="${f.email}"/>
           </div>
 
@@ -1110,7 +1110,7 @@
 
         <div class="field">
           <div class="field-label">${type === 'in' ? 'จำนวนรับเข้า' : 'จำนวนขอเบิก'}</div>
-          <input class="input input--form" type="number" min="1" placeholder="0"
+          <input class="input input--form" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"
                  data-key="${prefix}.qty" data-model="${prefix}Form.qty" value="${f.qty}"/>
         </div>
 
