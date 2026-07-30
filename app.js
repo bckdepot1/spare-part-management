@@ -142,6 +142,44 @@
     return error.message || fallback;
   }
 
+  // Avatars render at 32-84px, so a 128px thumbnail is all that is ever displayed.
+  // Storing the file as picked would mean carrying megabytes of base64 around for
+  // something shown the size of a fingernail.
+  var AVATAR_PX = 128;
+
+  /**
+   * Read a picked image file and return a small square JPEG data URL,
+   * centre-cropped to AVATAR_PX. Rejects if the file is not a decodable image.
+   */
+  function shrinkImageFile(file) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onerror = function () { reject(new Error('อ่านไฟล์รูปไม่สำเร็จ')); };
+      reader.onload = function () {
+        var img = new Image();
+        img.onerror = function () { reject(new Error('ไฟล์นี้ไม่ใช่รูปภาพที่รองรับ')); };
+        img.onload = function () {
+          try {
+            var canvas = document.createElement('canvas');
+            canvas.width = AVATAR_PX;
+            canvas.height = AVATAR_PX;
+            // Scale so the shorter side fills the square, then centre it: keeps the
+            // subject in frame instead of squashing the aspect ratio.
+            var scale = Math.max(AVATAR_PX / img.width, AVATAR_PX / img.height);
+            var w = img.width * scale;
+            var h = img.height * scale;
+            canvas.getContext('2d').drawImage(img, (AVATAR_PX - w) / 2, (AVATAR_PX - h) / 2, w, h);
+            resolve(canvas.toDataURL('image/jpeg', 0.8));
+          } catch (e) {
+            reject(new Error('ย่อรูปไม่สำเร็จ กรุณาเลือกรูปอื่น'));
+          }
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
   var ICON = {
     overview: '<path d="M3 11l9-8 9 8"></path><path d="M5 10v10h5v-6h4v6h5V10"></path>',
     receive: '<path d="M12 3v12M8 11l4 4 4-4"></path><path d="M4 19h16"></path>',
@@ -531,12 +569,15 @@
     signupAvatar: function (el) {
       var file = el.files && el.files[0];
       if (!file) return;
-      var reader = new FileReader();
-      reader.onload = function () {
-        state.signupForm.avatar = reader.result;
+      shrinkImageFile(file).then(function (dataUrl) {
+        state.signupForm.avatar = dataUrl;
+        state.signupForm.error = '';
         render();
-      };
-      reader.readAsDataURL(file);
+      }).catch(function (e) {
+        state.signupForm.avatar = '';
+        state.signupForm.error = errorMessage(e, 'ใช้รูปนี้ไม่ได้ กรุณาเลือกรูปอื่น');
+        render();
+      });
     },
 
     submitSignup: function () {
@@ -550,10 +591,15 @@
           f.error = 'รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร';
           return render();
         }
+        var avatar = f.avatar;
+        // The picture is deliberately NOT passed in `options.data`: that becomes auth
+        // metadata, which Supabase copies into the JWT, and the JWT rides in a request
+        // header on every call. An image there overflows the header and every request
+        // from the account fails. It goes into `profiles` via RPC just below instead.
         return supabaseClient.auth.signUp({
           email: usernameToEmail(f.username),
           password: f.password,
-          options: { data: { username: f.username.trim(), name: f.name, contact_email: f.email, avatar_url: f.avatar || null } }
+          options: { data: { username: f.username.trim(), name: f.name, contact_email: f.email } }
         }).then(function (res) {
           if (res.error) {
             f.error = /already|registered|exists/i.test(res.error.message)
@@ -561,9 +607,19 @@
               : 'สมัครไม่สำเร็จ: ' + res.error.message;
             return render();
           }
-          // New accounts start as 'pending' — sign back out immediately even though
-          // signUp may hand back an active session.
-          return supabaseClient.auth.signOut().then(function () {
+          // signUp leaves a valid session behind, which is the one chance to write the
+          // picture before signing out. A failure here costs only the picture, so it is
+          // swallowed rather than failing an otherwise successful sign-up.
+          // Promise.resolve() wrapper matters: rpc() hands back a thenable builder that
+          // has .then() but no .catch(), so catching directly on it throws.
+          return (avatar
+            ? Promise.resolve(supabaseClient.rpc('set_my_avatar', { p_avatar: avatar })).catch(function () {})
+            : Promise.resolve()
+          ).then(function () {
+            // New accounts start as 'pending' — sign back out immediately even though
+            // signUp may hand back an active session.
+            return supabaseClient.auth.signOut();
+          }).then(function () {
             state.signupForm = {
               username: '', password: '', name: '', email: '', avatar: '', error: '',
               success: 'ส่งคำขอสมัครสำเร็จ กรุณารอ Admin หรือ Supervisor อนุมัติบัญชีก่อนเข้าสู่ระบบ'
@@ -891,6 +947,7 @@
 
           ${f.error ? raw(html`<div class="alert alert--error">${f.error}</div>`) : ''}
           ${f.success ? raw(html`<div class="alert alert--success">${f.success}</div>`) : ''}
+          ${!f.error && !f.success && state.toast.msg ? raw(html`<div class="alert alert--error">${state.toast.msg}</div>`) : ''}
 
           <div class="grid-2">
             <div>
