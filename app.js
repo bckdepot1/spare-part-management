@@ -138,8 +138,14 @@
   function errorMessage(error, fallback) {
     if (!error) return fallback;
     if (isNetworkError(error)) return NETWORK_ERROR_MSG;
+    var text = String(error.message || '');
+    // Constraint violations arrive as raw Postgres English naming internal tables,
+    // which means nothing to whoever is looking at the screen.
+    if (/violates foreign key constraint/i.test(text)) {
+      return 'ลบไม่ได้เพราะยังมีข้อมูลอื่นในระบบอ้างอิงถึงรายการนี้อยู่ กรุณาแจ้งผู้ดูแลระบบ';
+    }
     // RPC exceptions raised with `raise exception '...'` arrive in error.message as-is.
-    return error.message || fallback;
+    return text || fallback;
   }
 
   // Avatars render at 32-84px, so a 128px thumbnail is all that is ever displayed.
@@ -752,7 +758,7 @@
       if (id === state.currentUser.id) {
         return showToast('ไม่สามารถลบบัญชีที่ใช้งานอยู่ได้', 'error');
       }
-      if (!window.confirm('ยืนยันการลบบัญชีผู้ใช้งานนี้?')) return;
+      if (!window.confirm('ยืนยันการลบบัญชีผู้ใช้งานนี้?\n\nประวัติการรับ-จ่ายที่ผู้ใช้นี้ทำไว้จะยังคงอยู่ในระบบ พร้อมชื่อผู้ดำเนินการเดิม')) return;
       guarded('deleteUser' + id, function () {
         return supabaseClient.rpc('delete_user', { p_user_id: id }).then(function (res) {
           if (res.error) return showToast(errorMessage(res.error, 'ลบไม่สำเร็จ'), 'error');
