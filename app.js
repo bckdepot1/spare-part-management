@@ -120,9 +120,24 @@
     return target;
   }
 
+  var NETWORK_ERROR_MSG = 'เชื่อมต่อฐานข้อมูลไม่สำเร็จ — เครือข่ายที่ใช้อยู่อาจบล็อกการเชื่อมต่อ กรุณาลองใหม่ หรือสลับไปใช้เน็ตมือถือ/เครือข่ายอื่น';
+
+  /**
+   * True when a failure came from the connection itself rather than from Postgres.
+   * Corporate proxies reset the TLS connection, which surfaces as a thrown TypeError
+   * ("Failed to fetch") rather than a PostgREST error payload — worth telling apart,
+   * because the fix is completely different from a real credential/permission problem.
+   */
+  function isNetworkError(error) {
+    if (!error) return false;
+    var text = String(error.message || error.details || error) + '';
+    return /failed to fetch|networkerror|err_connection|load failed|fetch failed|network request failed/i.test(text);
+  }
+
   /** Human-readable text from a Supabase/Postgres error, falling back to a generic message. */
   function errorMessage(error, fallback) {
     if (!error) return fallback;
+    if (isNetworkError(error)) return NETWORK_ERROR_MSG;
     // RPC exceptions raised with `raise exception '...'` arrive in error.message as-is.
     return error.message || fallback;
   }
@@ -306,30 +321,46 @@
     });
   }
 
+  /**
+   * Bounce back to the login screen showing `msg`.
+   *
+   * The sign-out is best-effort on purpose: when the network is what failed in the
+   * first place, signOut() fails too, and awaiting it would swallow the very message
+   * explaining what went wrong — leaving the button looking like it did nothing.
+   */
+  function failLogin(msg) {
+    return Promise.resolve()
+      .then(function () { return supabaseClient.auth.signOut(); })
+      .catch(function () { /* already offline / no session — nothing to clean up */ })
+      .then(function () {
+        state.currentUser = null;
+        setState({ view: 'login', loginForm: blankLoginForm(msg) });
+      });
+  }
+
   /** After a valid Supabase session exists, load the matching profile and gate on its status. */
   function enterAsUser(userId) {
     return supabaseClient.from('profiles').select('*').eq('id', userId).single().then(function (res) {
       if (res.error || !res.data) {
-        return supabaseClient.auth.signOut().then(function () {
-          setState({ view: 'login', loginForm: blankLoginForm('ไม่พบข้อมูลผู้ใช้งาน กรุณาลองเข้าสู่ระบบใหม่') });
-        });
+        return failLogin(isNetworkError(res.error)
+          ? NETWORK_ERROR_MSG
+          : 'ไม่พบข้อมูลผู้ใช้งาน กรุณาลองเข้าสู่ระบบใหม่');
       }
       var profile = res.data;
       if (profile.status === 'pending') {
-        return supabaseClient.auth.signOut().then(function () {
-          setState({ view: 'login', loginForm: blankLoginForm('บัญชีนี้ยังรอ Admin หรือ Supervisor อนุมัติ') });
-        });
+        return failLogin('บัญชีนี้ยังรอ Admin หรือ Supervisor อนุมัติ');
       }
       if (profile.status === 'rejected') {
-        return supabaseClient.auth.signOut().then(function () {
-          setState({ view: 'login', loginForm: blankLoginForm('บัญชีนี้ถูกปฏิเสธการสมัคร กรุณาติดต่อผู้ดูแลระบบ') });
-        });
+        return failLogin('บัญชีนี้ถูกปฏิเสธการสมัคร กรุณาติดต่อผู้ดูแลระบบ');
       }
       state.currentUser = mapProfileRow(profile);
       return loadAll().then(function () {
         subscribeRealtime();
         setState({ view: 'app', page: 'overview' });
       });
+    }).catch(function (e) {
+      // Covers a thrown fetch failure anywhere above, including inside loadAll().
+      return failLogin(errorMessage(e, 'เข้าสู่ระบบไม่สำเร็จ กรุณาลองใหม่อีกครั้ง'));
     });
   }
 
@@ -459,10 +490,17 @@
           email: usernameToEmail(f.username), password: f.password
         }).then(function (res) {
           if (res.error) {
-            state.loginForm.error = 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง';
+            // A dropped connection must not be reported as bad credentials — that
+            // sends the user off resetting a password that was never the problem.
+            state.loginForm.error = isNetworkError(res.error)
+              ? NETWORK_ERROR_MSG
+              : 'ชื่อผู้ใช้หรือรหัสผ่านไม่ถูกต้อง';
             return render();
           }
           return enterAsUser(res.data.user.id);
+        }).catch(function (e) {
+          state.loginForm.error = errorMessage(e, 'เข้าสู่ระบบไม่สำเร็จ กรุณาลองใหม่อีกครั้ง');
+          return render();
         });
       });
     },
@@ -810,6 +848,7 @@
           <div class="auth-sub">กรุณาเข้าสู่ระบบเพื่อใช้งานระบบ</div>
 
           ${f.error ? raw(html`<div class="alert alert--error">${f.error}</div>`) : ''}
+          ${!f.error && state.toast.msg ? raw(html`<div class="alert alert--error">${state.toast.msg}</div>`) : ''}
 
           <div class="field">
             <div class="field-label">User</div>
@@ -1259,7 +1298,11 @@
   function usersPage() {
     var admin = isAdmin();
     var pending = pendingUsers();
-    var list = state.users.filter(function (u) { return u.status !== 'pending'; });
+    // Only approved accounts belong in the main list. Listing 'rejected' here too
+    // made a rejection look like an approval — the rejected person showed up
+    // indistinguishable from everyone else.
+    var list = state.users.filter(function (u) { return u.status === 'active'; });
+    var rejected = state.users.filter(function (u) { return u.status === 'rejected'; });
 
     return html`
       ${pending.length ? raw(html`
@@ -1276,6 +1319,26 @@
                   <div class="pending-actions">
                     <button class="btn-sm btn-approve" data-act="approveUser" data-id="${u.id}">อนุมัติ</button>
                     <button class="btn-sm btn-reject" data-act="rejectUser" data-id="${u.id}">ปฏิเสธ</button>
+                  </div>
+                </div>`);
+            })}
+          </div>
+        </div>`) : ''}
+
+      ${rejected.length ? raw(html`
+        <div class="pending-card pending-card--rejected">
+          <div class="pending-title">บัญชีที่ถูกปฏิเสธ (${rejected.length})</div>
+          <div class="pending-list">
+            ${rejected.map(function (u) {
+              return raw(html`
+                <div class="pending-item pending-item--rejected">
+                  <div class="pending-main">
+                    <div class="pending-head">${u.name} (${u.username})</div>
+                    <div class="pending-meta">${u.email} · เข้าสู่ระบบไม่ได้</div>
+                  </div>
+                  <div class="pending-actions">
+                    <button class="btn-sm btn-approve" data-act="approveUser" data-id="${u.id}">อนุมัติย้อนหลัง</button>
+                    ${admin ? raw(html`<button class="btn-sm btn-reject" data-act="deleteUser" data-id="${u.id}">ลบ</button>`) : ''}
                   </div>
                 </div>`);
             })}
