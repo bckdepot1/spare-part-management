@@ -38,6 +38,7 @@
     pending: 'รออนุมัติ',
     rejected: 'ปฏิเสธ',
     ok: 'ปกติ',
+    near: 'ใกล้ Min',
     low: 'ต่ำกว่า Min',
     high: 'สูงกว่า Max'
   };
@@ -469,12 +470,19 @@
     return state.stock.find(function (s) { return s.code.trim().toLowerCase() === q; }) || null;
   }
 
+  // How close to Min still counts as "ใกล้ Min" — 30% above it, matching the
+  // threshold the Overview used before these statuses were unified.
+  var NEAR_MIN_RATIO = 1.3;
+
   function stockStatus(item) {
     if (item.qty < item.min) return 'low';
     // max === 0 reads as "no ceiling set" rather than "must be zero" — much of the
     // master list was imported with the Max column left blank, and flagging all of
     // those as overstocked the moment anything is received would be noise.
     if (item.max > 0 && item.qty > item.max) return 'high';
+    // Checked after 'high' on purpose: stock sitting above Max is not running low,
+    // even where Max was entered below Min.
+    if (item.min > 0 && item.qty <= item.min * NEAR_MIN_RATIO) return 'near';
     return 'ok';
   }
 
@@ -558,7 +566,7 @@
   }
 
   function donutStats() {
-    var stats = { low: 0, ok: 0, high: 0 };
+    var stats = { low: 0, near: 0, ok: 0, high: 0 };
     state.stock.forEach(function (it) { stats[stockStatus(it)]++; });
     return stats;
   }
@@ -571,9 +579,11 @@
   function donutSegments() {
     var stats = donutStats();
     var total = state.stock.length || 1;
+    // Ordered green -> blue -> amber -> red so the ring reads as increasing attention.
     var order = [
       { key: 'ok',   label: STATUS_LABEL.ok,   color: '#16a34a', count: stats.ok },
       { key: 'high', label: STATUS_LABEL.high, color: '#2f6fed', count: stats.high },
+      { key: 'near', label: STATUS_LABEL.near, color: '#f59e0b', count: stats.near },
       { key: 'low',  label: STATUS_LABEL.low,  color: '#dc2626', count: stats.low }
     ];
     var acc = 0;
@@ -710,6 +720,30 @@
             }, 2400);
           });
         });
+      });
+    },
+
+    /**
+     * Uploads the signed-in user's own picture. Goes through set_my_avatar rather
+     * than auth metadata: metadata ends up inside the JWT, which travels in a
+     * request header, and an image there is what previously locked these accounts
+     * out entirely.
+     */
+    myAvatar: function (el) {
+      var file = el.files && el.files[0];
+      if (!file) return;
+      el.value = '';   // allow re-picking the same file after a failure
+      guarded('myAvatar', function () {
+        return shrinkImageFile(file, AVATAR_PX).then(function (dataUrl) {
+          return saveMyAvatar(dataUrl, 'อัปเดตรูปโปรไฟล์สำเร็จ');
+        });
+      });
+    },
+
+    removeMyAvatar: function () {
+      if (!window.confirm('ยืนยันการลบรูปโปรไฟล์?')) return;
+      guarded('myAvatar', function () {
+        return saveMyAvatar('', 'ลบรูปโปรไฟล์แล้ว');
       });
     },
 
@@ -952,6 +986,23 @@
       downloadCsv(rows, 'inventory_' + todayStr() + '.csv');
     }
   };
+
+  /** Writes the caller's own picture and keeps the copies held in state in step. */
+  function saveMyAvatar(dataUrl, successMsg) {
+    // rpc() returns a thenable with no .catch(), so wrap before chaining.
+    return Promise.resolve(supabaseClient.rpc('set_my_avatar', { p_avatar: dataUrl }))
+      .then(function (res) {
+        if (res && res.error) throw res.error;
+        var id = state.currentUser.id;
+        state.currentUser.avatar = dataUrl;
+        // The user list holds its own copy, so the sidebar and จัดการผู้ใช้งาน
+        // do not disagree until the next reload.
+        state.users = state.users.map(function (u) {
+          return u.id === id ? Object.assign({}, u, { avatar: dataUrl }) : u;
+        });
+        showToast(successMsg, 'success');
+      });
+  }
 
   function updateStockMinMax(el, field) {
     var id = Number(el.dataset.id);
@@ -1306,7 +1357,9 @@
   function movementPage(type) {
     var f = type === 'in' ? state.receiveForm : state.issueForm;
     var prefix = type === 'in' ? 'receive' : 'issue';
-    var selected = type === 'out' ? findByCode(f.itemQuery) : null;
+    // Resolved for both directions now: seeing the picture and the balance while
+    // receiving is the same guard against picking the wrong part as when issuing.
+    var selected = findByCode(f.itemQuery);
 
     return html`
       <div class="card form-card">
@@ -1339,7 +1392,7 @@
               ${raw(datalist(prefix + 'UnitList', units()))}
             </div>
           </div>
-          ${selected ? raw(html`<div class="stock-hint">คงเหลือ: ${selected.qty} ${selected.unit}</div>`) : ''}
+          ${selected ? raw(itemPreview(selected)) : ''}
         </div>
 
         <div class="field">
@@ -1443,6 +1496,29 @@
   }
 
   /**
+   * Confirmation card for the part currently typed into a receive/issue form:
+   * picture, code and the balance on hand, so a mistyped code is obvious before
+   * the movement is saved. Falls back to a placeholder when no picture is stored.
+   */
+  function itemPreview(item) {
+    var img = state.stockImages[item.id];
+    var status = stockStatus(item);
+    return html`
+      <div class="item-preview">
+        ${img
+          ? raw(html`<div class="item-preview-img" style="background-image:url(${img})"></div>`)
+          : raw(html`<div class="item-preview-img item-preview-img--empty">${icon('inventory', 20)}</div>`)}
+        <div class="item-preview-body">
+          <div class="item-preview-code">${item.code}</div>
+          <div class="item-preview-meta">
+            คงเหลือ <b>${item.qty}</b> ${item.unit} · Min ${item.min} / Max ${item.max}
+            <span class="badge badge--${status}">${STATUS_LABEL[status]}</span>
+          </div>
+        </div>
+      </div>`;
+  }
+
+  /**
    * Thumbnail cell for one stock row. For Admin/Supervisor the whole thumbnail is a
    * file picker, so adding a picture is one click on the row itself; everyone else
    * just sees the picture.
@@ -1482,7 +1558,7 @@
             ${selectOptions([['all', 'ทุกหมวดหมู่']].concat(categories().map(function (c) { return [c, c]; })), state.invFilter.category)}
           </select>
           <select class="select" data-key="inv.status" data-model="invFilter.status">
-            ${selectOptions([['all', 'ทุกสถานะ'], ['low', 'ต่ำกว่า Min'], ['ok', 'ปกติ'], ['high', 'สูงกว่า Max']], state.invFilter.status)}
+            ${selectOptions([['all', 'ทุกสถานะ'], ['low', 'ต่ำกว่า Min'], ['near', 'ใกล้ Min'], ['ok', 'ปกติ'], ['high', 'สูงกว่า Max']], state.invFilter.status)}
           </select>
         </div>
         <div class="filter-count">แสดง ${rows.length} จาก ${state.stock.length} รายการ</div>
@@ -1614,6 +1690,25 @@
   function settingsPage() {
     var f = state.changePwForm;
     return html`
+      <div class="card form-card form-card--narrow" style="margin-bottom:20px;">
+        <div class="section-title" style="margin-bottom:16px;">รูปโปรไฟล์</div>
+        <div class="my-avatar-row">
+          <div class="avatar-circle my-avatar" style="${avatarStyle(state.currentUser.avatar)}">
+            ${state.currentUser.avatar ? '' : raw('<svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#98a2b3" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' + ICON.person + '</svg>')}
+          </div>
+          <div>
+            <label class="btn-pick">
+              ${state.currentUser.avatar ? 'เปลี่ยนรูป' : 'เลือกรูปโปรไฟล์'}
+              <input type="file" accept="image/*" data-act-change="myAvatar"/>
+            </label>
+            ${state.currentUser.avatar
+              ? raw(html`<button class="btn-link-danger" data-act="removeMyAvatar">ลบรูป</button>`)
+              : ''}
+            <div class="my-avatar-hint">ระบบจะย่อรูปให้อัตโนมัติ</div>
+          </div>
+        </div>
+      </div>
+
       <div class="card form-card form-card--narrow">
         <div class="section-title" style="margin-bottom:4px;">เปลี่ยนรหัสผ่าน</div>
         <div style="font-size:13px;color:#64748b;margin-bottom:20px;">บัญชี: ${state.currentUser.username}</div>
