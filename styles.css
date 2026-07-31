@@ -642,6 +642,44 @@ button { font-family: inherit; }
 
 /* ------------------------------------------------------------- inventory */
 
+.thumb {
+  width: 40px;
+  height: 40px;
+  border-radius: 6px;
+  background-color: #eef1f6;
+  background-size: cover;
+  background-position: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  flex-shrink: 0;
+}
+.thumb--empty { border: 1px dashed #cbd3e0; }
+
+.thumb-wrap { position: relative; display: inline-block; }
+.thumb-pick { display: block; cursor: pointer; }
+.thumb-pick input[type="file"] { display: none; }
+.thumb-pick:hover .thumb { outline: 2px solid var(--blue); outline-offset: 1px; }
+
+.thumb-remove {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--red);
+  color: #fff;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  display: none;
+}
+.thumb-wrap:hover .thumb-remove { display: block; }
+
 .filter-count {
   font-size: 12px;
   color: var(--muted);

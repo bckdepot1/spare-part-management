@@ -173,12 +173,15 @@
   // Storing the file as picked would mean carrying megabytes of base64 around for
   // something shown the size of a fingernail.
   var AVATAR_PX = 128;
+  // Part photos are shown small in the table but should still be legible enough to
+  // tell two similar fittings apart, so they get more pixels than an avatar.
+  var PART_IMAGE_PX = 200;
 
   /**
-   * Read a picked image file and return a small square JPEG data URL,
-   * centre-cropped to AVATAR_PX. Rejects if the file is not a decodable image.
+   * Read a picked image file and return a square JPEG data URL, centre-cropped to
+   * `size` pixels. Rejects if the file is not a decodable image.
    */
-  function shrinkImageFile(file) {
+  function shrinkImageFile(file, size) {
     return new Promise(function (resolve, reject) {
       var reader = new FileReader();
       reader.onerror = function () { reject(new Error('อ่านไฟล์รูปไม่สำเร็จ')); };
@@ -187,15 +190,16 @@
         img.onerror = function () { reject(new Error('ไฟล์นี้ไม่ใช่รูปภาพที่รองรับ')); };
         img.onload = function () {
           try {
+            var px = size || AVATAR_PX;
             var canvas = document.createElement('canvas');
-            canvas.width = AVATAR_PX;
-            canvas.height = AVATAR_PX;
+            canvas.width = px;
+            canvas.height = px;
             // Scale so the shorter side fills the square, then centre it: keeps the
             // subject in frame instead of squashing the aspect ratio.
-            var scale = Math.max(AVATAR_PX / img.width, AVATAR_PX / img.height);
+            var scale = Math.max(px / img.width, px / img.height);
             var w = img.width * scale;
             var h = img.height * scale;
-            canvas.getContext('2d').drawImage(img, (AVATAR_PX - w) / 2, (AVATAR_PX - h) / 2, w, h);
+            canvas.getContext('2d').drawImage(img, (px - w) / 2, (px - h) / 2, w, h);
             resolve(canvas.toDataURL('image/jpeg', 0.8));
           } catch (e) {
             reject(new Error('ย่อรูปไม่สำเร็จ กรุณาเลือกรูปอื่น'));
@@ -255,6 +259,7 @@
     currentUser: null,
     users: [],
     stock: [],
+    stockImages: {},   // item id -> picture data URL, loaded once per sign-in
     transactions: [],
     loginForm: { username: '', password: '', error: '', showPw: false },
     signupForm: { username: '', password: '', name: '', email: '', avatar: '', error: '', success: '' },
@@ -348,8 +353,24 @@
     });
   }
 
+  /**
+   * Pictures are loaded once per sign-in and then left alone — deliberately not
+   * part of refreshStock(), which fires on every receive/issue and would otherwise
+   * re-download every picture each time anyone moves stock.
+   */
+  function loadStockImages() {
+    return supabaseClient.from('stock_images').select('item_id,image').then(function (res) {
+      // A missing table just means db/add_stock_images.sql has not been run yet;
+      // the list still works, it simply has no pictures to show.
+      if (res.error) { state.stockImages = {}; return; }
+      var map = {};
+      res.data.forEach(function (r) { map[r.item_id] = r.image; });
+      state.stockImages = map;
+    });
+  }
+
   function loadAll() {
-    return Promise.all([loadStock(), loadTransactions(), loadProfiles()]);
+    return Promise.all([loadStock(), loadTransactions(), loadProfiles(), loadStockImages()]);
   }
 
   function refreshStock() { return loadStock().then(render); }
@@ -581,8 +602,8 @@
         unsubscribeRealtime();
         return supabaseClient.auth.signOut().then(function () {
           setState({
-            view: 'login', currentUser: null, stock: [], transactions: [], users: [],
-            page: 'overview'
+            view: 'login', currentUser: null, stock: [], stockImages: {},
+            transactions: [], users: [], page: 'overview'
           });
         });
       });
@@ -602,7 +623,7 @@
     signupAvatar: function (el) {
       var file = el.files && el.files[0];
       if (!file) return;
-      shrinkImageFile(file).then(function (dataUrl) {
+      shrinkImageFile(file, AVATAR_PX).then(function (dataUrl) {
         state.signupForm.avatar = dataUrl;
         state.signupForm.error = '';
         render();
@@ -764,6 +785,37 @@
 
     stockMin: function (el) { updateStockMinMax(el, 'min'); },
     stockMax: function (el) { updateStockMinMax(el, 'max'); },
+
+    stockImage: function (el) {
+      var id = Number(el.dataset.id);
+      var file = el.files && el.files[0];
+      if (!file) return;
+      el.value = '';   // let the same file be picked again after a failure
+      guarded('stockImage' + id, function () {
+        return shrinkImageFile(file, PART_IMAGE_PX).then(function (dataUrl) {
+          // rpc() returns a thenable without .catch(), so wrap before chaining.
+          return Promise.resolve(supabaseClient.rpc('set_stock_image', { p_item_id: id, p_image: dataUrl }))
+            .then(function (res) {
+              if (res && res.error) throw res.error;
+              state.stockImages[id] = dataUrl;
+              showToast('อัปเดตรูปอุปกรณ์สำเร็จ', 'success');
+            });
+        });
+      });
+    },
+
+    removeStockImage: function (el) {
+      var id = Number(el.dataset.id);
+      if (!window.confirm('ยืนยันการลบรูปอุปกรณ์นี้?')) return;
+      guarded('stockImage' + id, function () {
+        return Promise.resolve(supabaseClient.rpc('set_stock_image', { p_item_id: id, p_image: '' }))
+          .then(function (res) {
+            if (res && res.error) throw res.error;
+            delete state.stockImages[id];
+            showToast('ลบรูปอุปกรณ์แล้ว', 'success');
+          });
+      });
+    },
 
     // -- users --------------------------------------------------------------
 
@@ -1334,6 +1386,29 @@
     });
   }
 
+  /**
+   * Thumbnail cell for one stock row. For Admin/Supervisor the whole thumbnail is a
+   * file picker, so adding a picture is one click on the row itself; everyone else
+   * just sees the picture.
+   */
+  function stockThumb(item, editable) {
+    var img = state.stockImages[item.id];
+    var inner = img
+      ? html`<div class="thumb" style="background-image:url(${img})"></div>`
+      : html`<div class="thumb thumb--empty">${icon('inventory', 16)}</div>`;
+
+    if (!editable) return inner;
+
+    return html`
+      <div class="thumb-wrap">
+        <label class="thumb-pick" title="${img ? 'เปลี่ยนรูป' : 'เพิ่มรูป'}">
+          ${raw(inner)}
+          <input type="file" accept="image/*" data-act-change="stockImage" data-id="${item.id}"/>
+        </label>
+        ${img ? raw(html`<button class="thumb-remove" title="ลบรูป" data-act="removeStockImage" data-id="${item.id}">&times;</button>`) : ''}
+      </div>`;
+  }
+
   function inventoryPage() {
     var editable = canDirectStock();
     var rows = filteredStock();
@@ -1359,7 +1434,7 @@
           <table class="table">
             <thead>
               <tr>
-                <th>#</th><th>อุปกรณ์</th><th>หมวดหมู่</th><th>หน่วย</th>
+                <th>#</th><th>รูป</th><th>อุปกรณ์</th><th>หมวดหมู่</th><th>หน่วย</th>
                 <th class="num">คงเหลือ</th><th class="num">Min</th><th class="num">Max</th><th class="mid">สถานะ</th>
               </tr>
             </thead>
@@ -1369,6 +1444,7 @@
                 return raw(html`
                   <tr>
                     <td style="color:#98a2b3;font-size:12px;">${it.id}</td>
+                    <td>${raw(stockThumb(it, editable))}</td>
                     <td class="strong">${it.code}</td>
                     <td class="soft">${it.category}</td>
                     <td class="soft">${it.unit}</td>
@@ -1382,7 +1458,7 @@
                     <td class="mid"><span class="badge badge--${status}">${STATUS_LABEL[status]}</span></td>
                   </tr>`);
               })}
-              ${rows.length ? '' : raw('<tr><td class="empty" colspan="8">ไม่พบอุปกรณ์ที่ตรงกับเงื่อนไข</td></tr>')}
+              ${rows.length ? '' : raw('<tr><td class="empty" colspan="9">ไม่พบอุปกรณ์ที่ตรงกับเงื่อนไข</td></tr>')}
             </tbody>
           </table>
         </div>
