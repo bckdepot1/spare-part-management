@@ -552,12 +552,28 @@ button { font-family: inherit; }
 }
 .donut-value { font-size: 20px; font-weight: 800; color: var(--navy); }
 .donut-unit { font-size: 10.5px; color: var(--muted); }
-.donut-legend { display: flex; flex-direction: column; gap: 10px; }
-.donut-legend > div { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--dark); }
+.donut--clickable { cursor: pointer; }
+.donut--clickable:hover .donut-ring { filter: brightness(1.06); }
+
+.donut-legend { display: flex; flex-direction: column; gap: 6px; }
+.donut-legend-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--dark);
+  background: none;
+  border: none;
+  padding: 4px 8px;
+  margin: -4px -8px;
+  border-radius: 7px;
+  cursor: pointer;
+  text-align: left;
+}
+.donut-legend-row:hover { background: var(--line-soft); }
+
+.donut-hint { font-size: 11.5px; color: var(--muted); margin-top: 12px; }
 .swatch { width: 10px; height: 10px; border-radius: 3px; }
-.swatch--normal { background: var(--green); }
-.swatch--near { background: var(--amber); }
-.swatch--low { background: var(--red); }
 
 .muted-note { font-size: 12.5px; color: var(--muted); padding: 12px 0; }
 

@@ -291,6 +291,13 @@
     render();
   }
 
+  /** Opens the equipment list showing only `status`, clearing other filters so the
+   *  jump lands on exactly the group that was clicked. */
+  function jumpToStatus(status) {
+    state.invFilter = { search: '', category: 'all', status: status || 'all' };
+    setState({ page: 'inventory' });
+  }
+
   function canDirectStock() {
     var r = state.currentUser && state.currentUser.role;
     return r === 'admin' || r === 'supervisor';
@@ -551,13 +558,30 @@
   }
 
   function donutStats() {
-    var stats = { normal: 0, near: 0, low: 0 };
-    state.stock.forEach(function (it) {
-      if (it.qty < it.min) stats.low++;
-      else if (it.qty <= it.min * 1.3) stats.near++;
-      else stats.normal++;
-    });
+    var stats = { low: 0, ok: 0, high: 0 };
+    state.stock.forEach(function (it) { stats[stockStatus(it)]++; });
     return stats;
+  }
+
+  /**
+   * The donut slices, each carrying the arc it occupies so a click can be mapped
+   * back to a status. Shares stockStatus() with the table, so the counts here and
+   * the rows behind the inventory filter can never disagree.
+   */
+  function donutSegments() {
+    var stats = donutStats();
+    var total = state.stock.length || 1;
+    var order = [
+      { key: 'ok',   label: STATUS_LABEL.ok,   color: '#16a34a', count: stats.ok },
+      { key: 'high', label: STATUS_LABEL.high, color: '#2f6fed', count: stats.high },
+      { key: 'low',  label: STATUS_LABEL.low,  color: '#dc2626', count: stats.low }
+    ];
+    var acc = 0;
+    return order.map(function (seg) {
+      var from = (acc / total) * 360;
+      acc += seg.count;
+      return Object.assign({}, seg, { from: from, to: (acc / total) * 360 });
+    });
   }
 
   // ----------------------------------------------------------------- actions
@@ -724,6 +748,32 @@
 
     nav: function (el) {
       setState({ page: el.dataset.page });
+    },
+
+    filterByStatus: function (el) {
+      jumpToStatus(el.dataset.status);
+    },
+
+    /**
+     * Works out which slice was clicked from where the pointer landed. The ring is a
+     * conic-gradient, so there are no per-slice elements to attach handlers to —
+     * the angle from the centre is what identifies the slice. Clicking the hole
+     * clears the filter and shows everything.
+     */
+    donutJump: function (el, e) {
+      if (!state.stock.length) return;
+      var rect = el.getBoundingClientRect();
+      var dx = e.clientX - (rect.left + rect.width / 2);
+      var dy = e.clientY - (rect.top + rect.height / 2);
+      var radius = Math.sqrt(dx * dx + dy * dy);
+
+      if (radius <= rect.width * 0.36) return jumpToStatus('all');   // the hole
+      if (radius > rect.width / 2) return;                            // outside the ring
+
+      // Measured clockwise from 12 o'clock, matching how conic-gradient lays slices out.
+      var deg = ((Math.atan2(dx, -dy) * 180) / Math.PI + 360) % 360;
+      var hit = donutSegments().find(function (seg) { return deg >= seg.from && deg < seg.to; });
+      if (hit) jumpToStatus(hit.key);
     },
 
     openDatePicker: function (el) {
@@ -1113,10 +1163,11 @@
     var lowItems = state.stock.filter(function (it) { return it.qty < it.min; });
     var top = topIssuedItems();
 
-    var normalDeg = total ? (stats.normal / total) * 360 : 0;
-    var nearDeg = normalDeg + (total ? (stats.near / total) * 360 : 0);
+    var segments = donutSegments();
     var donutGradient = total
-      ? 'conic-gradient(#16a34a 0deg ' + normalDeg + 'deg, #f59e0b ' + normalDeg + 'deg ' + nearDeg + 'deg, #dc2626 ' + nearDeg + 'deg 360deg)'
+      ? 'conic-gradient(' + segments.map(function (seg) {
+          return seg.color + ' ' + seg.from + 'deg ' + seg.to + 'deg';
+        }).join(', ') + ')'
       : '#eef1f6';
 
     return html`
@@ -1215,7 +1266,7 @@
         <div class="card">
           <div class="card-title">Stock คงเหลือตามช่วง Min-Max</div>
           <div class="donut-row">
-            <div class="donut">
+            <div class="donut donut--clickable" data-act="donutJump" title="คลิกที่วงหรือรายการด้านข้างเพื่อดูอุปกรณ์ตามสถานะ">
               <div class="donut-ring" style="background:${donutGradient};"></div>
               <div class="donut-hole">
                 <div class="donut-value">${total}</div>
@@ -1223,11 +1274,16 @@
               </div>
             </div>
             <div class="donut-legend">
-              <div><span class="swatch swatch--normal"></span><span>ปกติ ( &gt; Min ) <b>${stats.normal}</b> รายการ</span></div>
-              <div><span class="swatch swatch--near"></span><span>ใกล้ Min <b>${stats.near}</b> รายการ</span></div>
-              <div><span class="swatch swatch--low"></span><span>ต่ำกว่า Min <b>${stats.low}</b> รายการ</span></div>
+              ${segments.map(function (seg) {
+                return raw(html`
+                  <button class="donut-legend-row" data-act="filterByStatus" data-status="${seg.key}">
+                    <span class="swatch" style="background:${seg.color};"></span>
+                    <span>${seg.label} <b>${seg.count}</b> รายการ</span>
+                  </button>`);
+              })}
             </div>
           </div>
+          <div class="donut-hint">คลิกเพื่อดูรายการอุปกรณ์ตามสถานะ</div>
         </div>
       </div>`;
   }
