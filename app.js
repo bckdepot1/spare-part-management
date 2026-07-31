@@ -38,7 +38,8 @@
     pending: 'รออนุมัติ',
     rejected: 'ปฏิเสธ',
     ok: 'ปกติ',
-    low: 'ต่ำกว่า Min'
+    low: 'ต่ำกว่า Min',
+    high: 'สูงกว่า Max'
   };
 
   // The chart draws one column per day; a very wide range would produce
@@ -148,6 +149,26 @@
     return text || fallback;
   }
 
+  /**
+   * Build a CSV and hand it to the browser as a download. The leading U+FEFF is
+   * what makes Excel read the Thai text as UTF-8 instead of mojibake.
+   */
+  function downloadCsv(rows, filename) {
+    var csv = '\uFEFF' + rows.map(function (r) {
+      return r.map(function (c) { return '"' + String(c).replace(/"/g, '""') + '"'; }).join(',');
+    }).join('\r\n');
+
+    var blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
   // Avatars render at 32-84px, so a 128px thumbnail is all that is ever displayed.
   // Storing the file as picked would mean carrying megabytes of base64 around for
   // something shown the size of a fingernail.
@@ -242,7 +263,7 @@
     issueForm: { date: todayStr(), itemQuery: '', category: '', unit: '', qty: '', note: '', error: '' },
     logFilter: { search: '', type: 'all', status: 'all', dateFrom: '', dateTo: '' },
     chartFilter: { from: daysAgoStr(13), to: todayStr() },
-    invFilter: { search: '', category: 'all' },
+    invFilter: { search: '', category: 'all', status: 'all' },
     toast: { msg: '', type: '' }
   };
 
@@ -421,7 +442,12 @@
   }
 
   function stockStatus(item) {
-    return item.qty < item.min ? 'low' : 'ok';
+    if (item.qty < item.min) return 'low';
+    // max === 0 reads as "no ceiling set" rather than "must be zero" — much of the
+    // master list was imported with the Max column left blank, and flagging all of
+    // those as overstocked the moment anything is received would be noise.
+    if (item.max > 0 && item.qty > item.max) return 'high';
+    return 'ok';
   }
 
   function categories() {
@@ -457,7 +483,8 @@
     var search = f.search.trim().toLowerCase();
     return state.stock
       .filter(function (it) { return !search || it.code.toLowerCase().indexOf(search) !== -1; })
-      .filter(function (it) { return f.category === 'all' || it.category === f.category; });
+      .filter(function (it) { return f.category === 'all' || it.category === f.category; })
+      .filter(function (it) { return f.status === 'all' || stockStatus(it) === f.status; });
   }
 
   function chartData() {
@@ -796,7 +823,7 @@
     // -- export -------------------------------------------------------------
 
     exportLog: function () {
-      var rows = [['วันที่', 'เวลา', 'ประเภท', 'รหัสอุปกรณ์', 'จำนวน', 'หมายเหตุ', 'ผู้ดำเนินการ', 'ผู้อนุมัติ', 'สถานะ']];
+      var rows = [['วันที่', 'เวลา', 'ประเภท', 'อุปกรณ์', 'จำนวน', 'หมายเหตุ', 'ผู้ดำเนินการ', 'ผู้อนุมัติ', 'สถานะ']];
       filteredTransactions().forEach(function (t) {
         rows.push([
           formatDateThai(t.date),
@@ -810,20 +837,17 @@
           STATUS_LABEL[t.status] || t.status
         ]);
       });
-      // Excel needs the UTF-8 BOM to read Thai text in a CSV correctly.
-      var csv = '﻿' + rows.map(function (r) {
-        return r.map(function (c) { return '"' + String(c).replace(/"/g, '""') + '"'; }).join(',');
-      }).join('\r\n');
+      downloadCsv(rows, 'log_' + todayStr() + '.csv');
+    },
 
-      var blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-      var url = URL.createObjectURL(blob);
-      var a = document.createElement('a');
-      a.href = url;
-      a.download = 'log_' + todayStr() + '.csv';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+    /** Exports exactly what the filters are showing, so the file matches the screen. */
+    exportInventory: function () {
+      var rows = [['#', 'อุปกรณ์', 'หมวดหมู่', 'หน่วย', 'คงเหลือ', 'Min', 'Max', 'สถานะ']];
+      filteredStock().forEach(function (it) {
+        var st = stockStatus(it);
+        rows.push([it.id, it.code, it.category, it.unit, it.qty, it.min, it.max, STATUS_LABEL[st]]);
+      });
+      downloadCsv(rows, 'inventory_' + todayStr() + '.csv');
     }
   };
 
@@ -1316,19 +1340,26 @@
 
     return html`
       <div class="card">
-        <div class="section-title" style="margin-bottom:16px;">รายการอุปกรณ์ทั้งหมด (${state.stock.length})</div>
+        <div class="section-head">
+          <div class="section-title">รายการอุปกรณ์ทั้งหมด (${state.stock.length})</div>
+          <button class="btn-export" data-act="exportInventory">${icon('receive', 14)}Export Excel</button>
+        </div>
         <div class="toolbar">
-          <input class="input" type="text" placeholder="ค้นหารหัสอุปกรณ์..."
+          <input class="input" type="text" placeholder="ค้นหาอุปกรณ์..."
                  data-key="inv.search" data-model="invFilter.search" value="${state.invFilter.search}"/>
           <select class="select select--cat" data-key="inv.category" data-model="invFilter.category">
             ${selectOptions([['all', 'ทุกหมวดหมู่']].concat(categories().map(function (c) { return [c, c]; })), state.invFilter.category)}
           </select>
+          <select class="select" data-key="inv.status" data-model="invFilter.status">
+            ${selectOptions([['all', 'ทุกสถานะ'], ['low', 'ต่ำกว่า Min'], ['ok', 'ปกติ'], ['high', 'สูงกว่า Max']], state.invFilter.status)}
+          </select>
         </div>
+        <div class="filter-count">แสดง ${rows.length} จาก ${state.stock.length} รายการ</div>
         <div class="inv-scroll" data-scroll-key="inventory">
           <table class="table">
             <thead>
               <tr>
-                <th>#</th><th>รหัสอุปกรณ์</th><th>หมวดหมู่</th><th>หน่วย</th>
+                <th>#</th><th>อุปกรณ์</th><th>หมวดหมู่</th><th>หน่วย</th>
                 <th class="num">คงเหลือ</th><th class="num">Min</th><th class="num">Max</th><th class="mid">สถานะ</th>
               </tr>
             </thead>
