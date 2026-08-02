@@ -270,6 +270,7 @@
     logFilter: { search: '', type: 'all', status: 'all', dateFrom: '', dateTo: '' },
     chartFilter: { from: daysAgoStr(13), to: todayStr() },
     invFilter: { search: '', category: 'all', status: 'all' },
+    newItemForm: null,   // non-null while the add-item form is open
     toast: { msg: '', type: '' }
   };
 
@@ -898,6 +899,45 @@
             delete state.stockImages[id];
             showToast('ลบรูปอุปกรณ์แล้ว', 'success');
           });
+      });
+    },
+
+    toggleAddItem: function () {
+      // Min/Max default to 1 rather than 0: most parts added here are meant to be
+      // tracked from day one, and 0/0 would silently mean "never warn, no ceiling."
+      state.newItemForm = state.newItemForm
+        ? null
+        : { code: '', category: '', unit: '', qty: '', min: '1', max: '1', error: '' };
+      render();
+    },
+
+    submitAddItem: function () {
+      guarded('addItem', function () {
+        var f = state.newItemForm;
+        if (!f.code.trim()) {
+          f.error = 'กรุณากรอกชื่ออุปกรณ์';
+          return render();
+        }
+        var qty = f.qty === '' ? 0 : parseInt(f.qty, 10);
+        var min = f.min === '' ? 0 : parseInt(f.min, 10);
+        var max = f.max === '' ? 0 : parseInt(f.max, 10);
+        if ([qty, min, max].some(function (n) { return isNaN(n) || n < 0; })) {
+          f.error = 'จำนวน, Min และ Max ต้องเป็นตัวเลขไม่ติดลบ';
+          return render();
+        }
+        return Promise.resolve(supabaseClient.rpc('add_stock_item', {
+          p_code: f.code.trim(), p_category: f.category.trim(), p_unit: f.unit.trim(),
+          p_qty: qty, p_min: min, p_max: max
+        })).then(function (res) {
+          if (res && res.error) {
+            f.error = errorMessage(res.error, 'เพิ่มอุปกรณ์ไม่สำเร็จ');
+            return render();
+          }
+          state.newItemForm = null;
+          return refreshStock().then(function () {
+            showToast('เพิ่มอุปกรณ์ใหม่สำเร็จ', 'success');
+          });
+        });
       });
     },
 
@@ -1541,6 +1581,54 @@
       </div>`;
   }
 
+  /** New-equipment form shown above the table, toggled by the "เพิ่มอุปกรณ์ใหม่" button. */
+  function addItemForm() {
+    var f = state.newItemForm;
+    return html`
+      <div class="add-item-card">
+        <div class="add-item-title">เพิ่มอุปกรณ์ใหม่</div>
+        ${f.error ? raw(html`<div class="alert alert--error" style="font-size:12.5px;">${f.error}</div>`) : ''}
+        <div class="add-item-grid">
+          <div>
+            <div class="sub-label">ชื่ออุปกรณ์</div>
+            <input class="input input--sm" type="text" placeholder="เช่น สายไฟVCT-G"
+                   data-key="newitem.code" data-model="newItemForm.code" value="${f.code}"/>
+          </div>
+          <div>
+            <div class="sub-label">หมวดหมู่</div>
+            <input class="input input--sm" type="text" list="newItemCategoryList" placeholder="เช่น สายไฟชุดเต้ารับ"
+                   data-key="newitem.category" data-model="newItemForm.category" value="${f.category}"/>
+            ${raw(datalist('newItemCategoryList', categories()))}
+          </div>
+          <div>
+            <div class="sub-label">หน่วย</div>
+            <input class="input input--sm" type="text" list="newItemUnitList" placeholder="เช่น ม้วน"
+                   data-key="newitem.unit" data-model="newItemForm.unit" value="${f.unit}"/>
+            ${raw(datalist('newItemUnitList', units()))}
+          </div>
+          <div>
+            <div class="sub-label">จำนวนเริ่มต้น</div>
+            <input class="input input--sm" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"
+                   data-key="newitem.qty" data-model="newItemForm.qty" value="${f.qty}"/>
+          </div>
+          <div>
+            <div class="sub-label">Min</div>
+            <input class="input input--sm" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"
+                   data-key="newitem.min" data-model="newItemForm.min" value="${f.min}"/>
+          </div>
+          <div>
+            <div class="sub-label">Max</div>
+            <input class="input input--sm" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"
+                   data-key="newitem.max" data-model="newItemForm.max" value="${f.max}"/>
+          </div>
+        </div>
+        <div class="add-item-actions">
+          <button class="btn-sm btn-approve" data-act="submitAddItem">บันทึกอุปกรณ์ใหม่</button>
+          <button class="btn-sm btn-reject" data-act="toggleAddItem">ยกเลิก</button>
+        </div>
+      </div>`;
+  }
+
   function inventoryPage() {
     var editable = canDirectStock();
     var rows = filteredStock();
@@ -1549,8 +1637,12 @@
       <div class="card">
         <div class="section-head">
           <div class="section-title">รายการอุปกรณ์ทั้งหมด (${state.stock.length})</div>
-          <button class="btn-export" data-act="exportInventory">${icon('receive', 14)}Export Excel</button>
+          <div class="section-head-actions">
+            ${editable ? raw(html`<button class="btn-export btn-export--outline" data-act="toggleAddItem">${icon('inventory', 14)}${state.newItemForm ? 'ปิดฟอร์ม' : 'เพิ่มอุปกรณ์ใหม่'}</button>`) : ''}
+            <button class="btn-export" data-act="exportInventory">${icon('receive', 14)}Export Excel</button>
+          </div>
         </div>
+        ${editable && state.newItemForm ? raw(addItemForm()) : ''}
         <div class="toolbar">
           <input class="input" type="text" placeholder="ค้นหาอุปกรณ์..."
                  data-key="inv.search" data-model="invFilter.search" value="${state.invFilter.search}"/>

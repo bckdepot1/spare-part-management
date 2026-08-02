@@ -636,6 +636,7 @@ button { font-family: inherit; }
   margin-bottom: 16px;
 }
 .section-title { font-size: 15px; font-weight: 700; color: var(--navy); }
+.section-head-actions { display: flex; gap: 10px; }
 
 .btn-export {
   display: flex;
@@ -649,6 +650,26 @@ button { font-family: inherit; }
   font-size: 12.5px;
   font-weight: 700;
   cursor: pointer;
+}
+.btn-export--outline { background: #fff; color: var(--blue); border: 1px solid var(--blue); }
+
+.add-item-card {
+  background: var(--blue-bg);
+  border: 1px solid var(--blue-line);
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+.add-item-title { font-size: 13.5px; font-weight: 700; color: var(--navy); margin-bottom: 12px; }
+.add-item-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.add-item-actions { display: flex; gap: 8px; }
+@media (max-width: 900px) {
+  .add-item-grid { grid-template-columns: repeat(2, 1fr); }
 }
 
 .toolbar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
