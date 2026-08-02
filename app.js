@@ -43,6 +43,13 @@
     high: 'สูงกว่า Max'
   };
 
+  // Marks the receive transaction submit_stock_item auto-creates for a new item's
+  // starting quantity (must match the literal in db/stock_item_receive_log.sql).
+  // While the item is still pending, this transaction is hidden from the log
+  // page's quick-approve card — approving it there would call approveTx, which
+  // has no idea it also needs to set Min/Max and activate the item.
+  var NEW_ITEM_RECEIVE_NOTE = 'เพิ่มอุปกรณ์ใหม่';
+
   // The chart draws one column per day; a very wide range would produce
   // thousands of columns, so the window is clamped.
   var MAX_CHART_DAYS = 120;
@@ -271,7 +278,7 @@
     chartFilter: { from: daysAgoStr(13), to: todayStr() },
     invFilter: { search: '', category: 'all', status: 'all' },
     receiveTab: 'receive',   // 'receive' | 'addItem' — sub-tabs under รับอะไหล่เข้า
-    newItemForm: { code: '', category: '', unit: '', qty: '', min: '1', max: '1', error: '' },
+    newItemForm: { date: todayStr(), code: '', category: '', unit: '', qty: '', min: '1', max: '1', error: '' },
     toast: { msg: '', type: '' }
   };
 
@@ -509,7 +516,9 @@
   }
 
   function pendingTransactions() {
-    return state.transactions.filter(function (t) { return t.status === 'pending'; });
+    return state.transactions.filter(function (t) {
+      return t.status === 'pending' && t.note !== NEW_ITEM_RECEIVE_NOTE;
+    });
   }
 
   function pendingUsers() {
@@ -941,14 +950,16 @@
         }
         return Promise.resolve(supabaseClient.rpc('submit_stock_item', {
           p_code: f.code.trim(), p_category: f.category.trim(), p_unit: f.unit.trim(),
-          p_qty: qty, p_min: min, p_max: max
+          p_qty: qty, p_min: min, p_max: max, p_date: f.date || todayStr()
         })).then(function (res) {
           if (res && res.error) {
             f.error = errorMessage(res.error, direct ? 'เพิ่มอุปกรณ์ไม่สำเร็จ' : 'ส่งคำขอไม่สำเร็จ');
             return render();
           }
-          state.newItemForm = { code: '', category: '', unit: '', qty: '', min: '1', max: '1', error: '' };
-          return refreshStock().then(function () {
+          state.newItemForm = { date: todayStr(), code: '', category: '', unit: '', qty: '', min: '1', max: '1', error: '' };
+          // A starting qty > 0 also creates a receive transaction (see
+          // db/stock_item_receive_log.sql), so both need refreshing.
+          return Promise.all([refreshStock(), refreshTransactions()]).then(function () {
             showToast(direct ? 'เพิ่มอุปกรณ์ใหม่สำเร็จ' : 'ส่งคำขอเพิ่มอุปกรณ์สำเร็จ กรุณารอ Admin หรือ Supervisor อนุมัติ', 'success');
           });
         });
@@ -967,7 +978,8 @@
         return Promise.resolve(supabaseClient.rpc('approve_stock_item', { p_item_id: id, p_min: min, p_max: max }))
           .then(function (res) {
             if (res && res.error) return showToast(errorMessage(res.error, 'อนุมัติไม่สำเร็จ'), 'error');
-            return refreshStock().then(function () {
+            // Approving also approves the linked receive transaction and applies its qty.
+            return Promise.all([refreshStock(), refreshTransactions()]).then(function () {
               showToast('อนุมัติอุปกรณ์ใหม่สำเร็จ', 'success');
             });
           });
@@ -981,7 +993,8 @@
         return Promise.resolve(supabaseClient.rpc('reject_stock_item', { p_item_id: id }))
           .then(function (res) {
             if (res && res.error) return showToast(errorMessage(res.error, 'ปฏิเสธไม่สำเร็จ'), 'error');
-            return refreshStock().then(function () {
+            // Rejecting also deletes the linked receive transaction.
+            return Promise.all([refreshStock(), refreshTransactions()]).then(function () {
               showToast('ปฏิเสธคำขอแล้ว', 'error');
             });
           });
@@ -1471,11 +1484,17 @@
           <div class="pending-title">คำขอเพิ่มอุปกรณ์รอการอนุมัติ (${pending.length})</div>
           <div class="pending-list">
             ${pending.map(function (it) {
+              // it.qty stays 0 while pending — the requested quantity lives on the
+              // linked receive transaction until approval applies it (see
+              // db/stock_item_receive_log.sql), so look that up for display.
+              var receipt = state.transactions.find(function (t) {
+                return t.itemId === it.id && t.note === NEW_ITEM_RECEIVE_NOTE && t.status === 'pending';
+              });
               return raw(html`
                 <div class="pending-item pending-item--stock">
                   <div class="pending-main">
                     <div class="pending-head">${it.code}</div>
-                    <div class="pending-meta">${it.category || 'ไม่ระบุหมวดหมู่'} · ${it.unit || 'ไม่ระบุหน่วย'} · จำนวนเริ่มต้น ${it.qty} · ขอโดย ${it.requestedName || '-'}</div>
+                    <div class="pending-meta">${it.category || 'ไม่ระบุหมวดหมู่'} · ${it.unit || 'ไม่ระบุหน่วย'} · จำนวนเริ่มต้น ${receipt ? receipt.qty : 0} (${receipt ? formatDateThai(receipt.date) : '-'}) · ขอโดย ${it.requestedName || '-'}</div>
                     <div class="pending-approve-fields">
                       <div>
                         <div class="sub-label">Min</div>
@@ -1499,6 +1518,11 @@
       <div class="card form-card">
         ${direct ? '' : raw(html`<div class="alert alert--warn">คำขอของคุณจะถูกส่งไปรออนุมัติจาก Supervisor/Admin — ผู้อนุมัติจะเป็นผู้กำหนดค่า Min/Max ให้</div>`)}
         ${f.error ? raw(html`<div class="alert alert--error" style="font-size:12.5px;">${f.error}</div>`) : ''}
+
+        <div class="field">
+          <div class="field-label">วันที่รับ</div>
+          <input class="input input--form" type="date" data-key="newitem.date" data-model="newItemForm.date" value="${f.date}"/>
+        </div>
 
         <div class="field">
           <div class="field-label">ชื่ออุปกรณ์</div>
