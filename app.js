@@ -270,7 +270,8 @@
     logFilter: { search: '', type: 'all', status: 'all', dateFrom: '', dateTo: '' },
     chartFilter: { from: daysAgoStr(13), to: todayStr() },
     invFilter: { search: '', category: 'all', status: 'all' },
-    newItemForm: null,   // non-null while the add-item form is open
+    receiveTab: 'receive',   // 'receive' | 'addItem' — sub-tabs under รับอะไหล่เข้า
+    newItemForm: { code: '', category: '', unit: '', qty: '', min: '1', max: '1', error: '' },
     toast: { msg: '', type: '' }
   };
 
@@ -323,7 +324,14 @@
   // --------------------------------------------------------------- row mapping
 
   function mapStockRow(r) {
-    return { id: r.id, code: r.code, category: r.category, unit: r.unit, qty: r.qty, min: r.min, max: r.max };
+    return {
+      id: r.id, code: r.code, category: r.category, unit: r.unit, qty: r.qty, min: r.min, max: r.max,
+      // 'active' | 'pending' — a request awaiting Admin/Supervisor approval. Distinct
+      // from stockStatus(), which is a computed low/near/ok/high health reading.
+      status: r.status || 'active',
+      requestedBy: r.requested_by, requestedName: r.requested_name,
+      approvedBy: r.approved_by, approvedName: r.approved_name
+    };
   }
 
   function mapTxRow(r) {
@@ -465,10 +473,15 @@
 
   // --------------------------------------------------------------- selectors
 
+  /** Everything except items still awaiting approval — what the app treats as "real" stock. */
+  function activeStock() {
+    return state.stock.filter(function (s) { return s.status === 'active'; });
+  }
+
   function findByCode(code) {
     var q = String(code || '').trim().toLowerCase();
     if (!q) return null;
-    return state.stock.find(function (s) { return s.code.trim().toLowerCase() === q; }) || null;
+    return activeStock().find(function (s) { return s.code.trim().toLowerCase() === q; }) || null;
   }
 
   // How close to Min still counts as "ใกล้ Min" — 30% above it, matching the
@@ -488,11 +501,11 @@
   }
 
   function categories() {
-    return Array.from(new Set(state.stock.map(function (s) { return s.category; })));
+    return Array.from(new Set(activeStock().map(function (s) { return s.category; })));
   }
 
   function units() {
-    return Array.from(new Set(state.stock.map(function (s) { return s.unit; })));
+    return Array.from(new Set(activeStock().map(function (s) { return s.unit; })));
   }
 
   function pendingTransactions() {
@@ -501,6 +514,10 @@
 
   function pendingUsers() {
     return state.users.filter(function (u) { return u.status === 'pending'; });
+  }
+
+  function pendingStockItems() {
+    return state.stock.filter(function (s) { return s.status === 'pending'; });
   }
 
   function filteredTransactions() {
@@ -518,7 +535,7 @@
   function filteredStock() {
     var f = state.invFilter;
     var search = f.search.trim().toLowerCase();
-    return state.stock
+    return activeStock()
       .filter(function (it) { return !search || it.code.toLowerCase().indexOf(search) !== -1; })
       .filter(function (it) { return f.category === 'all' || it.category === f.category; })
       .filter(function (it) { return f.status === 'all' || stockStatus(it) === f.status; });
@@ -568,7 +585,7 @@
 
   function donutStats() {
     var stats = { low: 0, near: 0, ok: 0, high: 0 };
-    state.stock.forEach(function (it) { stats[stockStatus(it)]++; });
+    activeStock().forEach(function (it) { stats[stockStatus(it)]++; });
     return stats;
   }
 
@@ -579,7 +596,7 @@
    */
   function donutSegments() {
     var stats = donutStats();
-    var total = state.stock.length || 1;
+    var total = activeStock().length || 1;
     // Ordered green -> blue -> amber -> red so the ring reads as increasing attention.
     var order = [
       { key: 'ok',   label: STATUS_LABEL.ok,   color: '#16a34a', count: stats.ok },
@@ -796,7 +813,7 @@
      * clears the filter and shows everything.
      */
     donutJump: function (el, e) {
-      if (!state.stock.length) return;
+      if (!activeStock().length) return;
       var rect = el.getBoundingClientRect();
       var dx = e.clientX - (rect.left + rect.width / 2);
       var dy = e.clientY - (rect.top + rect.height / 2);
@@ -902,42 +919,72 @@
       });
     },
 
-    toggleAddItem: function () {
-      // Min/Max default to 1 rather than 0: most parts added here are meant to be
-      // tracked from day one, and 0/0 would silently mean "never warn, no ceiling."
-      state.newItemForm = state.newItemForm
-        ? null
-        : { code: '', category: '', unit: '', qty: '', min: '1', max: '1', error: '' };
-      render();
+    receiveTab: function (el) {
+      setState({ receiveTab: el.dataset.tab });
     },
 
     submitAddItem: function () {
       guarded('addItem', function () {
         var f = state.newItemForm;
+        var direct = canDirectStock();
         if (!f.code.trim()) {
           f.error = 'กรุณากรอกชื่ออุปกรณ์';
           return render();
         }
         var qty = f.qty === '' ? 0 : parseInt(f.qty, 10);
-        var min = f.min === '' ? 0 : parseInt(f.min, 10);
-        var max = f.max === '' ? 0 : parseInt(f.max, 10);
-        if ([qty, min, max].some(function (n) { return isNaN(n) || n < 0; })) {
+        var min = direct ? (f.min === '' ? 0 : parseInt(f.min, 10)) : null;
+        var max = direct ? (f.max === '' ? 0 : parseInt(f.max, 10)) : null;
+        var numbersOk = !isNaN(qty) && qty >= 0 && (!direct || (!isNaN(min) && min >= 0 && !isNaN(max) && max >= 0));
+        if (!numbersOk) {
           f.error = 'จำนวน, Min และ Max ต้องเป็นตัวเลขไม่ติดลบ';
           return render();
         }
-        return Promise.resolve(supabaseClient.rpc('add_stock_item', {
+        return Promise.resolve(supabaseClient.rpc('submit_stock_item', {
           p_code: f.code.trim(), p_category: f.category.trim(), p_unit: f.unit.trim(),
           p_qty: qty, p_min: min, p_max: max
         })).then(function (res) {
           if (res && res.error) {
-            f.error = errorMessage(res.error, 'เพิ่มอุปกรณ์ไม่สำเร็จ');
+            f.error = errorMessage(res.error, direct ? 'เพิ่มอุปกรณ์ไม่สำเร็จ' : 'ส่งคำขอไม่สำเร็จ');
             return render();
           }
-          state.newItemForm = null;
+          state.newItemForm = { code: '', category: '', unit: '', qty: '', min: '1', max: '1', error: '' };
           return refreshStock().then(function () {
-            showToast('เพิ่มอุปกรณ์ใหม่สำเร็จ', 'success');
+            showToast(direct ? 'เพิ่มอุปกรณ์ใหม่สำเร็จ' : 'ส่งคำขอเพิ่มอุปกรณ์สำเร็จ กรุณารอ Admin หรือ Supervisor อนุมัติ', 'success');
           });
         });
+      });
+    },
+
+    approveStockItem: function (el) {
+      var id = Number(el.dataset.id);
+      var card = el.closest('.pending-item');
+      var min = parseInt(card.querySelector('[data-field="min"]').value, 10);
+      var max = parseInt(card.querySelector('[data-field="max"]').value, 10);
+      if (isNaN(min) || min < 0 || isNaN(max) || max < 0) {
+        return showToast('กรุณากรอกค่า Min/Max เป็นตัวเลขไม่ติดลบ', 'error');
+      }
+      guarded('approveStockItem' + id, function () {
+        return Promise.resolve(supabaseClient.rpc('approve_stock_item', { p_item_id: id, p_min: min, p_max: max }))
+          .then(function (res) {
+            if (res && res.error) return showToast(errorMessage(res.error, 'อนุมัติไม่สำเร็จ'), 'error');
+            return refreshStock().then(function () {
+              showToast('อนุมัติอุปกรณ์ใหม่สำเร็จ', 'success');
+            });
+          });
+      });
+    },
+
+    rejectStockItem: function (el) {
+      var id = Number(el.dataset.id);
+      if (!window.confirm('ยืนยันการปฏิเสธคำขอนี้? รายการจะถูกลบออก')) return;
+      guarded('approveStockItem' + id, function () {
+        return Promise.resolve(supabaseClient.rpc('reject_stock_item', { p_item_id: id }))
+          .then(function (res) {
+            if (res && res.error) return showToast(errorMessage(res.error, 'ปฏิเสธไม่สำเร็จ'), 'error');
+            return refreshStock().then(function () {
+              showToast('ปฏิเสธคำขอแล้ว', 'error');
+            });
+          });
       });
     },
 
@@ -1232,7 +1279,7 @@
 
         <div class="nav">
           ${raw(navItem('overview', 'Overview'))}
-          ${raw(navItem('receive', 'รับอะไหล่เข้า'))}
+          ${raw(navItem('receive', 'รับอะไหล่เข้า', canDirectStock() ? pendingStockItems().length : 0))}
           ${raw(navItem('issue', 'จ่ายอะไหล่ออก'))}
           ${raw(navItem('log', 'ประวัติ/Log', pendingTransactions().length))}
           ${raw(navItem('inventory', 'รายการอุปกรณ์'))}
@@ -1246,12 +1293,12 @@
 
   function overviewPage() {
     var stats = donutStats();
-    var total = state.stock.length;
+    var total = activeStock().length;
     var monthNow = todayStr().slice(0, 7);
     var approved = state.transactions.filter(function (t) { return t.status === 'approved'; });
     var kpiIn = approved.filter(function (t) { return t.type === 'in' && t.date.slice(0, 7) === monthNow; }).length;
     var kpiOut = approved.filter(function (t) { return t.type === 'out' && t.date.slice(0, 7) === monthNow; }).length;
-    var lowItems = state.stock.filter(function (it) { return it.qty < it.min; });
+    var lowItems = activeStock().filter(function (it) { return it.qty < it.min; });
     var top = topIssuedItems();
 
     var segments = donutSegments();
@@ -1394,6 +1441,110 @@
   }
 
   /** The receive and issue forms differ only in copy, colour and the stock hint. */
+  /** Tab bar shared by รับอะไหล่เข้า and its เพิ่มอุปกรณ์ใหม่ sibling, then delegates to whichever is active. */
+  function receiveSection() {
+    var pendingCount = canDirectStock() ? pendingStockItems().length : 0;
+    return html`
+      <div class="tabbar">
+        <button class="tab ${state.receiveTab === 'receive' ? 'is-active' : ''}" data-act="receiveTab" data-tab="receive">รับอะไหล่เข้า</button>
+        <button class="tab ${state.receiveTab === 'addItem' ? 'is-active' : ''}" data-act="receiveTab" data-tab="addItem">
+          เพิ่มอุปกรณ์ใหม่ ${pendingCount ? raw(html`<span class="tab-badge">${pendingCount}</span>`) : ''}
+        </button>
+      </div>
+      ${state.receiveTab === 'addItem' ? raw(addItemPage()) : raw(movementPage('in'))}`;
+  }
+
+  /**
+   * Operator submits a request that waits for approval; Admin/Supervisor add an item
+   * directly and set Min/Max themselves in the same step (mirrors how submit_transaction
+   * already treats direct vs. pending receive/issue). Admin/Supervisor additionally see
+   * everyone's pending requests here to approve or reject.
+   */
+  function addItemPage() {
+    var f = state.newItemForm;
+    var direct = canDirectStock();
+    var pending = direct ? pendingStockItems() : [];
+
+    return html`
+      ${pending.length ? raw(html`
+        <div class="pending-card">
+          <div class="pending-title">คำขอเพิ่มอุปกรณ์รอการอนุมัติ (${pending.length})</div>
+          <div class="pending-list">
+            ${pending.map(function (it) {
+              return raw(html`
+                <div class="pending-item pending-item--stock">
+                  <div class="pending-main">
+                    <div class="pending-head">${it.code}</div>
+                    <div class="pending-meta">${it.category || 'ไม่ระบุหมวดหมู่'} · ${it.unit || 'ไม่ระบุหน่วย'} · จำนวนเริ่มต้น ${it.qty} · ขอโดย ${it.requestedName || '-'}</div>
+                    <div class="pending-approve-fields">
+                      <div>
+                        <div class="sub-label">Min</div>
+                        <input class="input input--sm" type="text" inputmode="numeric" pattern="[0-9]*" data-field="min" value="1"/>
+                      </div>
+                      <div>
+                        <div class="sub-label">Max</div>
+                        <input class="input input--sm" type="text" inputmode="numeric" pattern="[0-9]*" data-field="max" value="1"/>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="pending-actions">
+                    <button class="btn-sm btn-approve" data-act="approveStockItem" data-id="${it.id}">อนุมัติ</button>
+                    <button class="btn-sm btn-reject" data-act="rejectStockItem" data-id="${it.id}">ปฏิเสธ</button>
+                  </div>
+                </div>`);
+            })}
+          </div>
+        </div>`) : ''}
+
+      <div class="card form-card">
+        ${direct ? '' : raw(html`<div class="alert alert--warn">คำขอของคุณจะถูกส่งไปรออนุมัติจาก Supervisor/Admin — ผู้อนุมัติจะเป็นผู้กำหนดค่า Min/Max ให้</div>`)}
+        ${f.error ? raw(html`<div class="alert alert--error" style="font-size:12.5px;">${f.error}</div>`) : ''}
+
+        <div class="field">
+          <div class="field-label">ชื่ออุปกรณ์</div>
+          <input class="input input--form" type="text" placeholder="เช่น สายไฟ VCT-G"
+                 data-key="newitem.code" data-model="newItemForm.code" value="${f.code}"/>
+        </div>
+        <div class="form-row">
+          <div>
+            <div class="sub-label">หมวดหมู่</div>
+            <input class="input input--sm" type="text" list="newItemCategoryList" placeholder="เช่น สายไฟชุดเต้ารับ"
+                   data-key="newitem.category" data-model="newItemForm.category" value="${f.category}"/>
+            ${raw(datalist('newItemCategoryList', categories()))}
+          </div>
+          <div>
+            <div class="sub-label">หน่วย</div>
+            <input class="input input--sm" type="text" list="newItemUnitList" placeholder="เช่น ม้วน"
+                   data-key="newitem.unit" data-model="newItemForm.unit" value="${f.unit}"/>
+            ${raw(datalist('newItemUnitList', units()))}
+          </div>
+        </div>
+
+        <div class="field" style="margin-top:14px;">
+          <div class="field-label">จำนวนเริ่มต้น</div>
+          <input class="input input--form" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"
+                 data-key="newitem.qty" data-model="newItemForm.qty" value="${f.qty}"/>
+        </div>
+
+        ${direct ? raw(html`
+          <div class="form-row">
+            <div>
+              <div class="sub-label">Min</div>
+              <input class="input input--sm" type="text" inputmode="numeric" pattern="[0-9]*"
+                     data-key="newitem.min" data-model="newItemForm.min" value="${f.min}"/>
+            </div>
+            <div>
+              <div class="sub-label">Max</div>
+              <input class="input input--sm" type="text" inputmode="numeric" pattern="[0-9]*"
+                     data-key="newitem.max" data-model="newItemForm.max" value="${f.max}"/>
+            </div>
+          </div>`) : ''}
+
+        <div class="meta-line" style="margin-top:14px;">${direct ? 'ผู้เพิ่ม' : 'ผู้ขอเพิ่ม'}: ${state.currentUser.name} (${state.currentUser.username})</div>
+        <button class="btn btn--green" data-act="submitAddItem">${direct ? 'บันทึกอุปกรณ์ใหม่' : 'ส่งคำขอเพิ่มอุปกรณ์'}</button>
+      </div>`;
+  }
+
   function movementPage(type) {
     var f = type === 'in' ? state.receiveForm : state.issueForm;
     var prefix = type === 'in' ? 'receive' : 'issue';
@@ -1417,7 +1568,7 @@
           <div class="field-label">อุปกรณ์</div>
           <input class="input input--form" type="text" list="${prefix}ItemsList" placeholder="พิมพ์ค้นหาหรือเลือกอุปกรณ์..."
                  data-key="${prefix}.item" data-act-input="${prefix}Item" value="${f.itemQuery}"/>
-          ${raw(datalist(prefix + 'ItemsList', state.stock.map(function (s) { return s.code; })))}
+          ${raw(datalist(prefix + 'ItemsList', activeStock().map(function (s) { return s.code; })))}
           <div class="form-row">
             <div>
               <div class="sub-label">หมวดหมู่</div>
@@ -1581,54 +1732,6 @@
       </div>`;
   }
 
-  /** New-equipment form shown above the table, toggled by the "เพิ่มอุปกรณ์ใหม่" button. */
-  function addItemForm() {
-    var f = state.newItemForm;
-    return html`
-      <div class="add-item-card">
-        <div class="add-item-title">เพิ่มอุปกรณ์ใหม่</div>
-        ${f.error ? raw(html`<div class="alert alert--error" style="font-size:12.5px;">${f.error}</div>`) : ''}
-        <div class="add-item-grid">
-          <div>
-            <div class="sub-label">ชื่ออุปกรณ์</div>
-            <input class="input input--sm" type="text" placeholder="เช่น สายไฟVCT-G"
-                   data-key="newitem.code" data-model="newItemForm.code" value="${f.code}"/>
-          </div>
-          <div>
-            <div class="sub-label">หมวดหมู่</div>
-            <input class="input input--sm" type="text" list="newItemCategoryList" placeholder="เช่น สายไฟชุดเต้ารับ"
-                   data-key="newitem.category" data-model="newItemForm.category" value="${f.category}"/>
-            ${raw(datalist('newItemCategoryList', categories()))}
-          </div>
-          <div>
-            <div class="sub-label">หน่วย</div>
-            <input class="input input--sm" type="text" list="newItemUnitList" placeholder="เช่น ม้วน"
-                   data-key="newitem.unit" data-model="newItemForm.unit" value="${f.unit}"/>
-            ${raw(datalist('newItemUnitList', units()))}
-          </div>
-          <div>
-            <div class="sub-label">จำนวนเริ่มต้น</div>
-            <input class="input input--sm" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"
-                   data-key="newitem.qty" data-model="newItemForm.qty" value="${f.qty}"/>
-          </div>
-          <div>
-            <div class="sub-label">Min</div>
-            <input class="input input--sm" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"
-                   data-key="newitem.min" data-model="newItemForm.min" value="${f.min}"/>
-          </div>
-          <div>
-            <div class="sub-label">Max</div>
-            <input class="input input--sm" type="text" inputmode="numeric" pattern="[0-9]*" placeholder="0"
-                   data-key="newitem.max" data-model="newItemForm.max" value="${f.max}"/>
-          </div>
-        </div>
-        <div class="add-item-actions">
-          <button class="btn-sm btn-approve" data-act="submitAddItem">บันทึกอุปกรณ์ใหม่</button>
-          <button class="btn-sm btn-reject" data-act="toggleAddItem">ยกเลิก</button>
-        </div>
-      </div>`;
-  }
-
   function inventoryPage() {
     var editable = canDirectStock();
     var rows = filteredStock();
@@ -1636,13 +1739,9 @@
     return html`
       <div class="card">
         <div class="section-head">
-          <div class="section-title">รายการอุปกรณ์ทั้งหมด (${state.stock.length})</div>
-          <div class="section-head-actions">
-            ${editable ? raw(html`<button class="btn-export btn-export--outline" data-act="toggleAddItem">${icon('inventory', 14)}${state.newItemForm ? 'ปิดฟอร์ม' : 'เพิ่มอุปกรณ์ใหม่'}</button>`) : ''}
-            <button class="btn-export" data-act="exportInventory">${icon('receive', 14)}Export Excel</button>
-          </div>
+          <div class="section-title">รายการอุปกรณ์ทั้งหมด (${activeStock().length})</div>
+          <button class="btn-export" data-act="exportInventory">${icon('receive', 14)}Export Excel</button>
         </div>
-        ${editable && state.newItemForm ? raw(addItemForm()) : ''}
         <div class="toolbar">
           <input class="input" type="text" placeholder="ค้นหาอุปกรณ์..."
                  data-key="inv.search" data-model="invFilter.search" value="${state.invFilter.search}"/>
@@ -1653,7 +1752,7 @@
             ${selectOptions([['all', 'ทุกสถานะ'], ['low', 'ต่ำกว่า Min'], ['near', 'ใกล้ Min'], ['ok', 'ปกติ'], ['high', 'สูงกว่า Max']], state.invFilter.status)}
           </select>
         </div>
-        <div class="filter-count">แสดง ${rows.length} จาก ${state.stock.length} รายการ</div>
+        <div class="filter-count">แสดง ${rows.length} จาก ${activeStock().length} รายการ</div>
         <div class="inv-scroll" data-scroll-key="inventory">
           <table class="table">
             <thead>
@@ -1829,7 +1928,7 @@
 
   function pageBody() {
     switch (state.page) {
-      case 'receive': return movementPage('in');
+      case 'receive': return receiveSection();
       case 'issue': return movementPage('out');
       case 'log': return logPage();
       case 'inventory': return inventoryPage();
@@ -1845,7 +1944,7 @@
         ${raw(sidebar())}
         <div class="main" data-scroll-key="main">
           <div class="topbar">
-            <div class="topbar-title">${PAGE_TITLE[state.page] || ''}</div>
+            <div class="topbar-title">${state.page === 'receive' && state.receiveTab === 'addItem' ? 'เพิ่มอุปกรณ์ใหม่' : (PAGE_TITLE[state.page] || '')}</div>
             <div class="topbar-right">
               <div class="topbar-user">${state.currentUser.name}</div>
               <span class="topbar-role topbar-role--${state.currentUser.role}">${ROLE_LABEL[state.currentUser.role] || state.currentUser.role}</span>

@@ -636,7 +636,6 @@ button { font-family: inherit; }
   margin-bottom: 16px;
 }
 .section-title { font-size: 15px; font-weight: 700; color: var(--navy); }
-.section-head-actions { display: flex; gap: 10px; }
 
 .btn-export {
   display: flex;
@@ -651,26 +650,42 @@ button { font-family: inherit; }
   font-weight: 700;
   cursor: pointer;
 }
-.btn-export--outline { background: #fff; color: var(--blue); border: 1px solid var(--blue); }
 
-.add-item-card {
-  background: var(--blue-bg);
-  border: 1px solid var(--blue-line);
-  border-radius: 10px;
-  padding: 16px;
-  margin-bottom: 16px;
+/* sub-tabs under a nav page, e.g. รับอะไหล่เข้า / เพิ่มอุปกรณ์ใหม่ */
+.tabbar {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 18px;
+  border-bottom: 1px solid var(--line);
 }
-.add-item-title { font-size: 13.5px; font-weight: 700; color: var(--navy); margin-bottom: 12px; }
-.add-item-grid {
-  display: grid;
-  grid-template-columns: repeat(6, 1fr);
-  gap: 10px;
-  margin-bottom: 14px;
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 16px;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  font-size: 13.5px;
+  font-weight: 600;
+  color: var(--slate);
+  cursor: pointer;
+  margin-bottom: -1px;
 }
-.add-item-actions { display: flex; gap: 8px; }
-@media (max-width: 900px) {
-  .add-item-grid { grid-template-columns: repeat(2, 1fr); }
+.tab:hover { color: var(--navy); }
+.tab.is-active { color: var(--blue); border-bottom-color: var(--blue); }
+.tab-badge {
+  background: var(--amber);
+  color: var(--navy);
+  font-size: 10.5px;
+  font-weight: 800;
+  border-radius: 9px;
+  padding: 1px 7px;
 }
+
+/* Min/Max entry inside a pending stock-item approval card */
+.pending-item--stock { align-items: flex-start; }
+.pending-approve-fields { display: flex; gap: 10px; margin-top: 8px; max-width: 200px; }
 
 .toolbar { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
 .toolbar .input,
