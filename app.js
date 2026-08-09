@@ -278,6 +278,9 @@
     chartFilter: { from: daysAgoStr(13), to: todayStr() },
     invFilter: { search: '', category: 'all', status: 'all' },
     receiveTab: 'receive',   // 'receive' | 'addItem' — sub-tabs under รับอะไหล่เข้า
+    // Banners for requests that arrived while the approver was on another page.
+    // Unlike the toast these stay until dismissed, so one cannot be missed.
+    requestAlerts: [],
     newItemForm: { date: todayStr(), code: '', category: '', unit: '', qty: '', min: '1', max: '1', error: '' },
     toast: { msg: '', type: '' }
   };
@@ -397,9 +400,77 @@
     return Promise.all([loadStock(), loadTransactions(), loadProfiles(), loadStockImages()]);
   }
 
-  function refreshStock() { return loadStock().then(render); }
-  function refreshTransactions() { return loadTransactions().then(render); }
-  function refreshProfiles() { return loadProfiles().then(render); }
+  function refreshStock() { return loadStock().then(afterRefresh); }
+  function refreshTransactions() { return loadTransactions().then(afterRefresh); }
+  function refreshProfiles() { return loadProfiles().then(afterRefresh); }
+
+  function afterRefresh() {
+    announceNewRequests();
+    render();
+  }
+
+  // ------------------------------------------------------- request alerts
+
+  // Counts at the last check. null until the first load establishes a baseline —
+  // without that, signing in with requests already waiting would announce them
+  // as if they had just arrived.
+  var pendingBaseline = null;
+
+  function pendingCounts() {
+    return {
+      tx: pendingTransactions().length,
+      items: pendingStockItems().length,
+      users: pendingUsers().length
+    };
+  }
+
+  function resetPendingBaseline() {
+    pendingBaseline = canDirectStock() ? pendingCounts() : null;
+  }
+
+  /**
+   * Announces requests that appeared since the last check. Only approvers are
+   * told, since nobody else can act on them. Driven by the realtime refreshes,
+   * so it fires for requests raised by other people, which is the whole point —
+   * the approver has no other reason to be looking at the screen.
+   */
+  function announceNewRequests() {
+    if (!canDirectStock()) { pendingBaseline = null; return; }
+    var now = pendingCounts();
+    if (pendingBaseline === null) { pendingBaseline = now; return; }
+
+    var alerts = [];
+    if (now.tx > pendingBaseline.tx) {
+      alerts.push({ text: 'มีคำขอเบิก/รับอะไหล่รออนุมัติ ' + now.tx + ' รายการ', page: 'log' });
+    }
+    if (now.items > pendingBaseline.items) {
+      alerts.push({ text: 'มีคำขอเพิ่มอุปกรณ์ใหม่รออนุมัติ ' + now.items + ' รายการ', page: 'receive', tab: 'addItem' });
+    }
+    if (now.users > pendingBaseline.users) {
+      alerts.push({ text: 'มีบัญชีผู้ใช้งานใหม่รออนุมัติ ' + now.users + ' รายการ', page: 'users' });
+    }
+    pendingBaseline = now;
+    if (alerts.length) state.requestAlerts = state.requestAlerts.concat(alerts);
+    alerts.forEach(desktopNotify);
+  }
+
+  /**
+   * Fires an OS-level notification, which is the only part that reaches an
+   * approver whose browser is behind another window. Silently does nothing
+   * unless they have granted permission from ตั้งค่า.
+   */
+  function desktopNotify(alert) {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    try {
+      var n = new Notification('Spare Part Management', { body: alert.text, icon: 'assets/logo.svg' });
+      n.onclick = function () {
+        window.focus();
+        if (alert.tab) state.receiveTab = alert.tab;
+        setState({ page: alert.page });
+        n.close();
+      };
+    } catch (e) { /* some browsers reject construction outside a service worker */ }
+  }
 
   /** Keeps everyone's view live: any user's approve/receive/issue updates every open tab. */
   function subscribeRealtime() {
@@ -465,6 +536,9 @@
       }
       state.currentUser = mapProfileRow(profile);
       return loadAll().then(function () {
+        // Baseline before subscribing, so whatever was already waiting at sign-in
+        // is treated as known rather than announced as new.
+        resetPendingBaseline();
         subscribeRealtime();
         setState({ view: 'app', page: 'overview' });
       });
@@ -661,10 +735,11 @@
     logout: function () {
       guarded('logout', function () {
         unsubscribeRealtime();
+        pendingBaseline = null;
         return supabaseClient.auth.signOut().then(function () {
           setState({
             view: 'login', currentUser: null, stock: [], stockImages: {},
-            transactions: [], users: [], page: 'overview'
+            transactions: [], users: [], page: 'overview', requestAlerts: []
           });
         });
       });
@@ -930,6 +1005,36 @@
 
     receiveTab: function (el) {
       setState({ receiveTab: el.dataset.tab });
+    },
+
+    // -- request alerts -----------------------------------------------------
+
+    openAlert: function (el) {
+      var alert = state.requestAlerts[Number(el.dataset.index)];
+      if (!alert) return;
+      state.requestAlerts = [];
+      if (alert.tab) state.receiveTab = alert.tab;
+      setState({ page: alert.page });
+    },
+
+    dismissAlerts: function () {
+      setState({ requestAlerts: [] });
+    },
+
+    enableDesktopAlerts: function () {
+      if (!('Notification' in window)) {
+        return showToast('เบราว์เซอร์นี้ไม่รองรับการแจ้งเตือนบนเดสก์ท็อป', 'error');
+      }
+      // Must be called from a click — browsers reject the prompt otherwise.
+      Notification.requestPermission().then(function (result) {
+        if (result === 'granted') {
+          new Notification('Spare Part Management', { body: 'เปิดการแจ้งเตือนแล้ว', icon: 'assets/logo.svg' });
+          showToast('เปิดการแจ้งเตือนบนเดสก์ท็อปแล้ว', 'success');
+        } else {
+          showToast('ไม่ได้รับอนุญาต — เปิดสิทธิ์แจ้งเตือนให้เว็บนี้ในตั้งค่าเบราว์เซอร์', 'error');
+        }
+        render();
+      });
     },
 
     submitAddItem: function () {
@@ -1902,6 +2007,23 @@
       </div>`;
   }
 
+  /** Current desktop-notification permission, and the way to change it. */
+  function desktopAlertControl() {
+    if (!('Notification' in window)) {
+      return html`<div class="notify-state notify-state--off">เบราว์เซอร์นี้ไม่รองรับการแจ้งเตือนบนเดสก์ท็อป</div>`;
+    }
+    if (Notification.permission === 'granted') {
+      return html`<div class="notify-state notify-state--on">เปิดการแจ้งเตือนบนเดสก์ท็อปแล้ว</div>`;
+    }
+    if (Notification.permission === 'denied') {
+      // The browser will not re-prompt once denied; it has to be undone in site settings.
+      return html`<div class="notify-state notify-state--off">
+        ถูกบล็อกไว้ — เปิดสิทธิ์แจ้งเตือนให้เว็บนี้ได้ที่ไอคอนซ้ายของช่องที่อยู่เว็บ แล้วรีเฟรชหน้า
+      </div>`;
+    }
+    return html`<button class="btn-pick" data-act="enableDesktopAlerts">เปิดการแจ้งเตือนบนเดสก์ท็อป</button>`;
+  }
+
   function settingsPage() {
     var f = state.changePwForm;
     return html`
@@ -1923,6 +2045,16 @@
           </div>
         </div>
       </div>
+
+      ${canDirectStock() ? raw(html`
+        <div class="card form-card form-card--narrow" style="margin-bottom:20px;">
+          <div class="section-title" style="margin-bottom:6px;">การแจ้งเตือนคำขอ</div>
+          <div class="notify-hint">
+            แจ้งเตือนเมื่อมีคำขอเบิก/รับอะไหล่ คำขอเพิ่มอุปกรณ์ หรือบัญชีใหม่รออนุมัติ
+            — แถบแจ้งเตือนในเว็บทำงานอยู่แล้ว ส่วนการแจ้งเตือนบนเดสก์ท็อปจะเด้งให้เห็นแม้สลับไปหน้าต่างอื่น
+          </div>
+          ${raw(desktopAlertControl())}
+        </div>`) : ''}
 
       <div class="card form-card form-card--narrow">
         <div class="section-title" style="margin-bottom:4px;">เปลี่ยนรหัสผ่าน</div>
@@ -1976,6 +2108,18 @@
           </div>
           <div class="content">
             ${state.toast.msg ? raw(html`<div class="toast ${state.toast.type === 'error' ? 'toast--error' : ''}">${state.toast.msg}</div>`) : ''}
+            ${state.requestAlerts.length ? raw(html`
+              <div class="alert-stack">
+                ${state.requestAlerts.map(function (a, i) {
+                  return raw(html`
+                    <div class="request-alert">
+                      <span class="request-alert-dot"></span>
+                      <span class="request-alert-text">${a.text}</span>
+                      <button class="request-alert-go" data-act="openAlert" data-index="${i}">ดูรายการ</button>
+                      <button class="request-alert-close" data-act="dismissAlerts" title="ปิด">&times;</button>
+                    </div>`);
+                })}
+              </div>`) : ''}
             ${raw(pageBody())}
           </div>
         </div>
