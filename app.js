@@ -23,6 +23,19 @@
 
   var ROLE_LABEL = { admin: 'Admin', supervisor: 'Supervisor', operator: 'Operator' };
 
+  // Position of each role in the user list: Admin first, then Supervisor, then
+  // Operator, with creation order breaking ties within a role.
+  var ROLE_ORDER = { admin: 0, supervisor: 1, operator: 2 };
+
+  function roleRank(role) {
+    return ROLE_ORDER[role] === undefined ? 99 : ROLE_ORDER[role];
+  }
+
+  /** Oldest account first. */
+  function byCreatedAt(a, b) {
+    return String(a.createdAt || '').localeCompare(String(b.createdAt || ''));
+  }
+
   var PAGE_TITLE = {
     overview: 'Overview',
     receive: 'รับอะไหล่เข้า',
@@ -354,7 +367,11 @@
   }
 
   function mapProfileRow(r) {
-    return { id: r.id, username: r.username, name: r.name, email: r.email, avatar: r.avatar_url, role: r.role, status: r.status };
+    return {
+      id: r.id, username: r.username, name: r.name, email: r.email,
+      avatar: r.avatar_url, role: r.role, status: r.status,
+      createdAt: r.created_at
+    };
   }
 
   // ----------------------------------------------------------------- data I/O
@@ -374,7 +391,8 @@
   }
 
   function loadProfiles() {
-    return supabaseClient.from('profiles').select('*').order('id').then(function (res) {
+    // created_at, not id: the id is a random uuid, so ordering by it is arbitrary.
+    return supabaseClient.from('profiles').select('*').order('created_at').then(function (res) {
       if (res.error) throw res.error;
       state.users = res.data.map(mapProfileRow);
     });
@@ -1919,12 +1937,21 @@
 
   function usersPage() {
     var admin = isAdmin();
-    var pending = pendingUsers();
+    // Oldest request first, so the approval queue is answered in the order it arrived.
+    var pending = pendingUsers().slice().sort(byCreatedAt);
     // Only approved accounts belong in the main list. Listing 'rejected' here too
     // made a rejection look like an approval — the rejected person showed up
     // indistinguishable from everyone else.
-    var list = state.users.filter(function (u) { return u.status === 'active'; });
-    var rejected = state.users.filter(function (u) { return u.status === 'rejected'; });
+    var list = state.users
+      .filter(function (u) { return u.status === 'active'; })
+      .slice()
+      .sort(function (a, b) {
+        return (roleRank(a.role) - roleRank(b.role)) || byCreatedAt(a, b);
+      });
+    var rejected = state.users
+      .filter(function (u) { return u.status === 'rejected'; })
+      .slice()
+      .sort(byCreatedAt);
 
     return html`
       ${pending.length ? raw(html`
