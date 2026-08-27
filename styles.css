@@ -119,6 +119,8 @@ button { font-family: inherit; }
 .btn--green { background: var(--green); font-size: 14.5px; }
 .btn--red { background: var(--red); font-size: 14.5px; }
 .btn:hover { filter: brightness(1.06); }
+.btn:disabled { background: #cbd3e0; cursor: not-allowed; }
+.btn:disabled:hover { filter: none; }
 
 .badge {
   display: inline-block;

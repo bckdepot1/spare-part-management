@@ -1251,6 +1251,14 @@
       f.error = 'กรุณาเลือกอุปกรณ์จากรายการและระบุจำนวนให้ถูกต้อง';
       return render();
     }
+    // Applies to every role: an item at 0 cannot be issued or even requested,
+    // since approval could never go through. The quantity check below stays
+    // limited to those who cut stock directly — for an Operator, asking for more
+    // than the balance is left for the approver to decide on.
+    if (type === 'out' && item.qty <= 0) {
+      f.error = 'อุปกรณ์นี้ไม่มีคงเหลือใน Stock จึงเบิกไม่ได้';
+      return render();
+    }
     if (type === 'out' && canDirectStock() && qty > item.qty) {
       f.error = 'จำนวนขอเบิกมากกว่าจำนวนคงเหลือใน Stock';
       return render();
@@ -1698,12 +1706,15 @@
     // Resolved for both directions now: seeing the picture and the balance while
     // receiving is the same guard against picking the wrong part as when issuing.
     var selected = findByCode(f.itemQuery);
+    // Say so up front rather than only on submit — there is nothing to take out.
+    var outOfStock = type === 'out' && !!selected && selected.qty <= 0;
 
     return html`
       <div class="card form-card">
         ${canDirectStock() ? '' : raw(html`<div class="alert alert--warn">${type === 'in'
           ? 'คำขอของคุณจะถูกส่งไปรออนุมัติจาก Supervisor/Admin ก่อนบันทึกเข้า Stock'
           : 'คำขอเบิกของคุณจะถูกส่งไปรออนุมัติจาก Supervisor/Admin ก่อนตัด Stock'}</div>`)}
+        ${outOfStock ? raw(html`<div class="alert alert--error" style="font-size:12.5px;">อุปกรณ์นี้ไม่มีคงเหลือใน Stock จึงเบิกไม่ได้</div>`) : ''}
         ${f.error ? raw(html`<div class="alert alert--error" style="font-size:12.5px;">${f.error}</div>`) : ''}
 
         <div class="field">
@@ -1746,7 +1757,8 @@
         </div>
 
         <div class="meta-line">${type === 'in' ? 'ผู้รับเข้า' : 'ผู้ขอเบิก'}: ${state.currentUser.name} (${state.currentUser.username})</div>
-        <button class="btn ${type === 'in' ? 'btn--green' : 'btn--red'}" data-act="${type === 'in' ? 'submitReceive' : 'submitIssue'}">บันทึกข้อมูล</button>
+        <button class="btn ${type === 'in' ? 'btn--green' : 'btn--red'}" ${outOfStock ? raw('disabled') : ''}
+                data-act="${type === 'in' ? 'submitReceive' : 'submitIssue'}">บันทึกข้อมูล</button>
       </div>`;
   }
 
